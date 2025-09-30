@@ -1,0 +1,15 @@
+/aitviewer/data/
+/results/
+/data/
+
+# Ignore Python cache and IDE files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.idea/
+.vscode/
+*.pkl
+imgui.ini
+train.sh
+test.sh
