@@ -335,8 +335,7 @@ class FrameModel(torch.nn.Module):
                  trans_size,
                  num_layers,
                  hidden_size,
-                 m_dropout = 0,
-                 only_pose = False):
+                 m_dropout = 0):
         super(FrameModel, self).__init__()
         self._init_args = dict(
             input_size=input_size,
@@ -345,15 +344,13 @@ class FrameModel(torch.nn.Module):
             trans_size=trans_size,
             num_layers=num_layers,
             hidden_size=hidden_size,
-            m_dropout=m_dropout,
-            only_pose=only_pose)
+            m_dropout=m_dropout)
         self.input_size = input_size
         self.betas_size = betas_size
         self.poses_size = poses_size
         self.trans_size = trans_size
         self.num_layers = num_layers
         self.hidden_size = hidden_size
-        self.only_pose = only_pose
         
 
         self.from_input = torch.nn.Linear(self.input_size, self.hidden_size)
@@ -382,11 +379,9 @@ class FrameModel(torch.nn.Module):
         
         pose_hat = self.to_pose(x)
         tran_hat = self.to_tran(x)
-        if self.only_pose:
-            shape_hat = torch.zeros([x.shape[0], 1, self.betas_size], device=x.device)
-        else:
-            s = self.to_shape(x)
-            shape_hat = torch.mean(s, dim=1, keepdim=True)
+
+        s = self.to_shape(x)
+        shape_hat = torch.mean(s, dim=1, keepdim=True)
 
         return {'poses': pose_hat,
                 'betas': shape_hat,
@@ -415,8 +410,7 @@ class SequenceModel(torch.nn.Module):
                  hidden_size,
                  m_dropout = 0,
                  model_type = 'gru',
-                 m_bidirectional= True,
-                 only_pose = False):
+                 m_bidirectional= True):
         super(SequenceModel, self).__init__()
         self.input_size = input_size
         self.betas_size = betas_size
@@ -434,13 +428,11 @@ class SequenceModel(torch.nn.Module):
             m_dropout=m_dropout,
             m_bidirectional=m_bidirectional,
             model_type=model_type,
-            only_pose=only_pose
         )
         self.is_bidirectional = m_bidirectional
         self.num_directions = 2 if m_bidirectional else 1
         self.model_type = model_type
         self.learn_init_state = True
-        self.only_pose = only_pose
 
 
         if m_dropout > 0.0:
@@ -544,7 +536,9 @@ class SequenceModel(torch.nn.Module):
     def forward(self, x, is_new_sequence=True):
         if is_new_sequence:
             self.final_state = None
-        self.init_state = self.final_state
+            self.init_state = self.cell_init(x)
+        else:
+            self.init_state = self.final_state
 
         inputs_ = self.input_drop(x)
 
@@ -560,7 +554,6 @@ class SequenceModel(torch.nn.Module):
             out = self.model(inputs_)
         else:
             # Get the initial state of the recurrent cells.
-            self.init_state = self.cell_init(inputs_)
             out, final_state = self.model(inputs_, self.init_state)
             self.final_state = final_state  
 
@@ -570,11 +563,8 @@ class SequenceModel(torch.nn.Module):
         tran_hat = self.to_tran(out)
         # Estimate shape if configured.
 
-        if self.only_pose:
-            shape_hat = torch.zeros([x.shape[0], 1, self.betas_size], device=x.device)
-        else:
-            s = self.to_shape(out)  # (N, F, N_BETAS)
-            shape_hat = torch.mean(s, dim=1, keepdim=True)
+        s = self.to_shape(out)  # (N, F, N_BETAS)
+        shape_hat = torch.mean(s, dim=1, keepdim=True)
 
         return {'poses': pose_hat,
                 'betas': shape_hat,
@@ -593,36 +583,3 @@ class SequenceModel(torch.nn.Module):
 
 
 
-def main():
-
-    # 1. load data
-    cfg = OmegaConf.load('./config.yaml')
-
-    dataset = MocapSequenceDataset(cfg.paths.dataset_dir)
-    subjects = set(dataset.subject_names)
-    subject_ids = {s:[i for i, n in enumerate(dataset.subject_names) if n == s] for s in subjects}
-
-
-
-    for ind in range(len(dataset)):
-        stage2_data = dataset[ind]
-
-        # 2. load model
-        moshpp = Moshpp(iter_stage1 = 1000, iter_stage2 = 1000)
-        stage2_data['markers_pos'] = torch.from_numpy(stage2_data['markers_pos'] / 1000).float()
-
-        moshpp.fit(stage2_data)
-
-
-
-    # 3. define loss and training (stage i and ii)
-
-    for data in dataset:
-        pass
-
-    # 4. test model
-
-
-
-if __name__ == '__main__':
-    main()

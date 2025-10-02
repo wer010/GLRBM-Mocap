@@ -13,6 +13,7 @@ from geo_utils import estimate_lcs_with_faces
 from utils import visualize, visualize_aitviewer
 from collections import defaultdict
 from pytorch3d.transforms import matrix_to_axis_angle, axis_angle_to_quaternion, quaternion_to_axis_angle, quaternion_multiply, quaternion_invert
+import lmdb
 
 rigidbody_marker_id = {
     "head": 335,
@@ -112,102 +113,206 @@ def rela_x_fn(x, marker_type = 'moshpp'):
         ret = torch.concatenate([pos_center, rel_pos, rel_ori], dim = -2)
     return ret
 
+def extractwindow(sample, window_size=120, mode='random'):
+    """
+    Extract a window of a fixed size. If the sequence is shorter than the desired window size it will return the
+    entire sequence without any padding.
+    """
+    n_frames = sample['poses'].shape[0]
+    assert n_frames >= window_size
+    if n_frames==window_size:
+        return sample
+    else:
+        if mode == 'beginning':
+            sf, ef = 0, window_size
+        elif mode == 'middle':
+            mid = n_frames // 2
+            sf = mid - window_size // 2
+            ef = sf + window_size
+        elif mode == 'random':
+            sf = torch.randint(0, n_frames - window_size + 1, [1])
+            ef = sf + window_size
+        else:
+            raise ValueError(f"Mode '{mode}' for window extraction unknown.")
+        ret = {k:v[sf:ef] for k,v in sample.items() if k != 'betas'}
+        ret['betas'] = sample['betas']
+        return ret
 
-class MetaBabelDataset(Dataset):
-    # Dataset class for meta training, the getitem func return data of a task
-    def __init__(self, path, use_rela_x = False, marker_type = 'moshpp', device = 'cuda'):
+
+def train_collate_fn(batch):
+    extracted_batch = [extractwindow(sample, 120, mode='random') for sample in batch]
+    ret = {k:torch.stack([sample[k] for sample in extracted_batch]) for k in extracted_batch[0].keys()}
+    return ret
+
+class AmassLmdbDataset(Dataset):
+    def __init__(self, path, use_rela_x = True, marker_type = 'moshpp', device='cuda'):
+        super(AmassLmdbDataset, self).__init__()
+        self.path = path
         self.use_rela_x = use_rela_x
         self.marker_type = marker_type
-
         self.device = device
-        with open(path, 'rb') as f:
-            self.data = pickle.load(f)
-        self.task_id = {}
-        self.samples_per_task = []
-        for i, key in enumerate(self.data.keys()):
-            self.task_id[i] = key
+        env = lmdb.open(path, readonly=True)
+        with env.begin(write=False) as txn:
+            self.len = int(txn.get('__len__'.encode()))
+    
+    def __len__(self):
+        return self.len
+    
+    def __getitem__(self, idx):
+        env = lmdb.open(self.path, readonly=True, lock=False)
+        key = idx.to_bytes(4, byteorder='big')
+        with env.begin(write=False) as txn:
+            value = txn.get(key)
+        data = pickle.loads(value)
+        if self.marker_type == 'rbm':
+            marker_info = torch.cat([data['marker_pos'], data['marker_ori']], dim=-1)
+        else:
+            marker_info = data['marker_pos']
+        if self.use_rela_x:
+            marker_info = rela_x_fn(marker_info, self.marker_type)
+        ret = {
+            'marker_info': marker_info.to(self.device),
+            'poses': data['poses'].to(self.device),
+            'betas': data['betas'].to(self.device),
+            'trans': data['trans'].to(self.device),
+            'joints': data['joints'].to(self.device),
+        }
+        return ret
+
+
+def subsample_to_60fps(orig_ft, orig_fps):
+        '''Get features at 30fps frame-rate
+        Args:
+            orig_ft <array> (T, 25*3): Feats. @ `orig_fps` frame-rate
+            orig_fps <float>: Frame-rate in original (ft) seq.
+        Return:
+            ft <array> (T', 25*3): Feats. @ 30fps
+        '''
+        T  = orig_ft['poses'].shape[0]
+        out_fps = 60.0
+        # Matching the sub-sampling used for rendering
+        if int(orig_fps)%int(out_fps):
+            sel_fr = np.floor(orig_fps / out_fps * np.arange(int(out_fps))).astype(int)
+            n_duration = int(T/int(orig_fps))
+            t_idxs = []
+            for i in range(n_duration):
+                t_idxs += list(i * int(orig_fps) + sel_fr)
+            if int(T % int(orig_fps)):
+                last_sec_frame_idx = n_duration*int(orig_fps)
+                t_idxs += [x+ last_sec_frame_idx for x in sel_fr if x + last_sec_frame_idx < T ]
+        else:
+            t_idxs = np.arange(0, T, orig_fps/out_fps, dtype=int)
+
+        ft = {}
+        for key, values in orig_ft.items():
+            if key in ['poses', 'trans']:
+                ft[key] = values[t_idxs]
+            else:
+                ft[key] = values
+
+        return ft
+
+
+def convert_amass_to_lmdb(data_root, output_file, marker_type):
+    """Convert AMASS to LMDB format that we can use during training."""
+    if marker_type == 'rbm':
+        vid = [value for value in rigidbody_marker_id.values()]
+    elif marker_type == 'moshpp':
+        vid = [value for value in moshpp_marker_id.values()]
+    n_marker = len(vid)
+    device = 'cuda'
+    pos_offset = torch.tensor([0.0095, 0, 0, 1]).expand([n_marker, -1]).to(device)
+    ori_offset = torch.eye(3).expand([n_marker, -1, -1]).to(device)
+    vid_tensor = torch.tensor(vid).to(device)
+
+    output_file = output_file + '_' + marker_type
+
+    print("Converting AMASS data under {} and exporting it to {} ...".format(data_root, output_file))
+
+    
+    npz_file_ids = glob(osp.join(data_root, '*',  '*stageii.npz'))
+
+
+    env = lmdb.open(output_file, map_size=10*1024**3)
+    with env.begin(write=True) as txn:
+        valid_i = 0
+        for file_id in tqdm(npz_file_ids):
+            sample = np.load(osp.join(file_id),allow_pickle=True)
+            fps = sample['mocap_frame_rate']
+            if fps <60:
+                print(f'{file_id} has fps < 60, skip.')
+                continue
+
+            if isinstance(sample['betas'],list):
+                print('only single person data is supported.')
+                continue
+            sample = subsample_to_60fps(sample, fps)
+            if sample['poses'].shape[0] <120:
+                continue
+            poses_body = sample['poses'][:, :66]  # (N_FRAMES, 66)
+            poses_hands = np.zeros([poses_body.shape[0], 6])
+            poses = np.concatenate([poses_body, poses_hands],axis=-1)
+            # 转成torch tensor
+            poses = torch.from_numpy(poses).float().to(device)
+            betas = torch.from_numpy(sample['betas'][:10]).float().to(device)  # (N_SHAPE_PARAMS, )
+            trans = torch.from_numpy(sample['trans']).float().to(device)  # (N_FRAMES, 30)
             
 
-    def __len__(self):
-        return len(self.task_id)
+            # Extract joint information, watch out for CUDA out of memory.
+            n_frames = poses.shape[0]
+            
+            if n_frames>3000:
+                n_slices = n_frames//3000
+                joints_list = []
+                marker_pos_list = []
+                marker_ori_list = []
+                for i in range(n_slices+1):
+                    marker_pos, marker_ori, v_posed, joints = virtual_marker(betas,
+                                                                     poses[3000*i:3000*(i+1),:],
+                                                                     trans[3000*i:3000*(i+1),:],
+                                                                     vid_tensor,
+                                                                     pos_offset,
+                                                                     ori_offset,
+                                                                     visualize_flag=False)
 
-    def __getitem__(self, t):
-        data = self.data[self.task_id[int(t)]]
-        data = {key:value.to(self.device) for key, value in data.items()}
-        data['task_name'] = self.task_id[int(t)]
-        if self.use_rela_x:
-            data['marker_info'] = rela_x_fn(data['marker_info'], self.marker_type)
-        return data
-
-
-class BabelDataset(Dataset):
-    def __init__(self, path, use_rela_x = False, marker_type = 'moshpp', device='cuda'):
-        self.use_rela_x = use_rela_x
-        self.marker_type = marker_type
-        self.device = device
-        with open(path, 'rb') as f:
-            raw_data = pickle.load(f)
-        fv = next(iter(raw_data.values()))
-        all_data = {key:[] for key in fv.keys()}
-
-        for v in raw_data.values():
-            for key, value in v.items():
-                all_data[key].append(value)
-
-        self.data = {k:torch.concatenate(v) for k,v in all_data.items()}
-
-    def __len__(self):
-        return len(next(iter(self.data.values())))
-
-    def __getitem__(self, t):
-        data = {key:value[t].to(self.device) for key, value in self.data.items()}
-        if self.use_rela_x:
-            data['marker_info'] = rela_x_fn(data['marker_info'], self.marker_type)
-        return data
-
-
-
-class MetaCollate:
-    def __init__(self, support_ratio=0.5, shuffle = False):
-        self.support_ratio = support_ratio
-        self.shuffle = shuffle
-
-    def __call__(self, data_list):
-        
-
-        support_sets = defaultdict(list)
-        query_sets = defaultdict(list)
-
-        for item in data_list:
-            n = item['poses'].shape[0]
-            indices = list(range(n))
-            if self.shuffle:
-                random.shuffle(indices)
-
-            split = int(n * self.support_ratio)  # 60% support
-            support_idx = indices[:split]
-            query_idx = indices[split:]
-
-            # 构建 support / query set
-            for key in item.keys():
-                if key == 'task_name':
-                    support_sets[key].append(item[key])
-                    query_sets[key].append(item[key])
-                else:
-                    support_sets[key].append(item[key][support_idx])
-                    query_sets[key].append(item[key][query_idx])
-        supp_ret = {}
-        qry_ret = {}
-        for key in support_sets.keys():
-            if key != 'task_name':
-                supp_ret[key] = torch.stack(support_sets[key])
-                qry_ret[key] = torch.stack(query_sets[key])
+                    marker_pos_list.append(marker_pos)
+                    marker_ori_list.append(marker_ori)
+                    joints_list.append(joints)
+                joints = torch.concatenate(joints_list)
+                marker_pos = torch.concatenate(marker_pos_list)
+                marker_ori = torch.concatenate(marker_ori_list)
             else:
-                supp_ret[key] = support_sets[key]
-                qry_ret[key] = query_sets[key]
+                marker_pos, marker_ori, v_posed, joints = virtual_marker(betas,
+                                                                     poses,
+                                                                     trans,
+                                                                     vid_tensor,
+                                                                     pos_offset,
+                                                                     ori_offset,
+                                                                     visualize_flag=False)
 
-        return supp_ret, qry_ret
 
+            assert joints.shape[0] == n_frames
+            marker_ori = matrix_to_axis_angle(marker_ori)
+
+            data_dict = {
+                    'poses': poses.detach().cpu(),     # (T, J*3)
+                    'betas': betas.detach().cpu(),     # (10,) or (16,)
+                    'trans': trans.detach().cpu(),     # (T, 3)
+                    'joints': joints.detach().cpu(),            # 可选字段
+                    'n_frames': n_frames,
+                    'marker_pos': marker_pos.detach().cpu(),
+                    'marker_ori': marker_ori.detach().cpu(),
+                    'file_path': file_id      # 保留原始路径，便于调试
+                }
+                
+            # 使用pickle序列化整个字典
+            key = valid_i.to_bytes(4, byteorder='big')
+            value = pickle.dumps(data_dict, protocol=4)  # protocol=4更高效
+            txn.put(key, value)
+            valid_i += 1
+
+
+        txn.put('__len__'.encode(), "{}".format(valid_i).encode())
 
 
 
@@ -272,101 +377,6 @@ def generate_marker_data(fp, marker_type = 'rbm', normalize_flags=[]):
         pickle.dump(save_data, f)
     return file_name
 
-def convert_dataset():
-    df = pd.read_excel('/home/lanhai/PycharmProjects/mosr/cmu_motion.xlsx', header = None)
-
-    motion_cates = df.iloc[:,0].dropna().unique().tolist()
-    sub_motion_cats = df.iloc[:,1].to_list()
-    subject_ids = df.columns[2:]
-
-    all_paths = []
-    motions = {}
-    for row_idx, row in df.iterrows():
-
-        if not pd.isna(row[0]):
-            sub_motions = {}
-            motion = row[0]
-        sub_motion_key = row[1]
-        sub_motion = {}
-        for sub in row[2:].dropna().to_list():
-            match = re.search(r'Subject (\d+)', sub)
-            sub_ind = match.group(1).zfill(2)
-            trials_ind_list = re.findall(r'\n(\d+)', sub)
-            sub_motion[sub_ind] = [s.zfill(2) for s in trials_ind_list]
-        sub_motions[sub_motion_key] = sub_motion
-        motions[motion] = sub_motions
-    one_motions = {}
-    all_motions = []
-    for motion, value in motions.items():
-        file_paths = []
-        for sub_motion, sub_value in value.items():
-            for subject, trials in sub_value.items():
-                for t in trials:
-                    file_path = osp.join('/home/lanhai/restore/dataset/mocap/amass/CMU-smplx-n/', subject, f'{subject}_{t}_stageii.npz')
-                    file_paths.append(file_path)
-                    trial = {
-                        'file_path':file_path,
-                        'trial_id': t,
-                        'subject_id': subject,
-                        'sub_motion':sub_motion,
-                        'motion': motion
-                    }
-                    all_motions.append(trial)
-        one_motions[motion] =  file_paths
-
-    model = Smpl(model_path='/home/lanhai/restore/dataset/mocap/models/smpl/SMPL_NEUTRAL.npz', device='cpu')
-
-    for key, value in one_motions.items():
-        output_file = f'/home/lanhai/restore/dataset/mocap/amass/CMU_motion/{key}.pkl'
-        if osp.exists(output_file):
-            continue
-        res = {}
-        motions = []
-        num_trials = len(value)
-        valid_num = 0
-        for file_path in value:
-            if osp.exists(file_path):
-                # convert to lmdb
-                valid_num+=1
-
-                data = np.load(file_path, allow_pickle=True)
-                print(f'{file_path} is {valid_num}th available amass data in {num_trials} trials with {data["poses"].shape[0]} frames')
-
-                betas = torch.from_numpy(data['betas'][0:10]).float()
-                # gender = torch.from_numpy(data['genders'][0])
-                pose_body = data['poses'][:, 0:66]
-                pose_hands = np.zeros([pose_body.shape[0], 6])
-                poses = np.concatenate([pose_body,pose_hands],axis=-1)
-                poses = torch.from_numpy(poses).float()
-                trans = torch.from_numpy(data['trans']).float()
-                if data["poses"].shape[0]>3000:
-                    n_slices = data["poses"].shape[0]//3000
-                    joints_list = []
-                    for i in range(n_slices+1):
-                        joints_list.append(model(betas=betas,
-                                       body_pose=poses[3000*i:3000*(i+1), 3:],
-                                       global_orient=poses[3000*i:3000*(i+1), 0:3],
-                                       transl=trans[3000*i:3000*(i+1),:])['joints'])
-                    joints = torch.concatenate(joints_list)
-                else:
-                    joints = model(betas=betas,
-                              body_pose=poses[:,3:],
-                              global_orient=poses[:, 0:3],
-                              transl=trans)['joints']
-                trial = {'betas': betas.cpu(),
-                         'poses': poses.cpu(),
-                         'trans': trans.cpu(),
-                         'joints': joints.cpu()
-                         }
-                motions.append(trial)
-        print(f'{valid_num} trials is save in {key} motion class')
-
-        with open(output_file,'wb') as f:
-            pickle.dump(motions, f)
-        del motions
-        torch.cuda.empty_cache()
-    print('All done')
-
 def virtual_marker(betas, 
                    pose, 
                    trans, 
@@ -392,8 +402,9 @@ def virtual_marker(betas,
     v_posed = output['vertices']
     joints = output['joints']
 
-    lcs = estimate_lcs_with_faces(vid=vid,
-                                  fid=model.vertex_faces[vid],
+    vid_tensor = vid[None,:].expand([pose.shape[0], -1]).to(betas.device)
+    lcs = estimate_lcs_with_faces(vid=vid_tensor,
+                                  fid=model.vertex_faces[vid_tensor],
                                   vertices=v_posed,
                                   faces=model.faces_tensor)
 
@@ -415,34 +426,9 @@ def virtual_marker(betas,
 
 if __name__ == '__main__':
     pass
-    # convert_dataset()
-    marker_type = 'rbm'
-    train_file_name = generate_marker_data('/home/lanhai/restore/dataset/mocap/mosr/meta_train_data.pkl', marker_type = marker_type, normalize_flags=['betas'])
+    # convert_amass_to_lmdb(data_root='data/CMU', output_file='data/CMU_lmdb', marker_type='rbm')
+    # convert_amass_to_lmdb(data_root='data/CMU', output_file='data/CMU_lmdb', marker_type='moshpp')
 
-    val_file_name = generate_marker_data('/home/lanhai/restore/dataset/mocap/mosr/meta_val_data.pkl', marker_type = marker_type, normalize_flags=['betas'])
-
-    with open(train_file_name, 'rb') as f:
-        raw_train_data = pickle.load(f)
-    with open(val_file_name, 'rb') as f:
-        raw_val_data = pickle.load(f)
-
-    merge_data = {}
-    for key, value in raw_train_data.items():
-        cache = {}
-        for k,v in value.items():
-            cache[k] = torch.concatenate([raw_train_data[key][k], raw_val_data[key][k][0:10]])
-        merge_data[key] = cache
-
-    keys = list(merge_data.keys())
-    first27_keys = keys[:27]
-    last3_keys = keys[27:]
-
-    A_first27 = {k: merge_data[k] for k in first27_keys}
-    A_last3 = {k: merge_data[k] for k in last3_keys}
-
-    # 保存成 pkl
-    with open(f"/home/lanhai/restore/dataset/mocap/mosr/{marker_type}/{osp.basename(train_file_name)}", "wb") as f:
-        pickle.dump(A_first27, f)
-
-    with open(f"/home/lanhai/restore/dataset/mocap/mosr/{marker_type}/{osp.basename(val_file_name)}", "wb") as f:
-        pickle.dump(A_last3, f)
+    # convert_amass_to_lmdb(data_root='data/BMLrub', output_file='data/BMLrub_lmdb', marker_type='rbm')
+    # convert_amass_to_lmdb(data_root='data/BMLrub', output_file='data/BMLrub_lmdb', marker_type='moshpp')
+    

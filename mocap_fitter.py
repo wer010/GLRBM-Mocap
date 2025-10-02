@@ -4,21 +4,17 @@ import torch
 import numpy as np
 import argparse
 import json
-from glob import glob
 import os.path as osp
-from data import rigidbody_marker_id, moshpp_marker_id, BabelDataset, MetaBabelDataset, virtual_marker, MetaCollate
+from data import rigidbody_marker_id, moshpp_marker_id, virtual_marker, AmassLmdbDataset, train_collate_fn
 from torch.utils.data import DataLoader, random_split
 from models import Moshpp, FrameModel, SequenceModel
 from metric import MetricsEngine
 from smpl import Smpl
 from tqdm import tqdm
-from utils import visualize, vis_diff
 from datetime import datetime
 from utils import visualize_aitviewer, vis_diff_aitviewer
 import torch.optim as optim
 from tensorboardX import SummaryWriter
-import higher
-from geo_utils import estimate_lcs_with_faces
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(True)
@@ -108,15 +104,15 @@ def train(
     best_mpjpe = torch.inf
     # 普通训练
 
-    trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=train_collate_fn)
     train_optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.StepLR(train_optimizer, step_size=epochs//10, gamma=0.8)
     global_step = 0
     print("Begin training.")
-    for epoch in tqdm(range(epochs)):
+    for epoch in range(epochs):
         model.train()
 
-        for data in trainloader:
+        for data in tqdm(trainloader):
             B = data["marker_info"].shape[0]
             L = data["marker_info"].shape[1]
             x = data["marker_info"].contiguous().view(B, L, -1)
@@ -137,29 +133,31 @@ def train(
             losses["total_loss"].backward()
             train_optimizer.step()
 
-        scheduler.step()
+        # scheduler.step()
 
         # evaluate the query set (support set)
 
         eval_result = test(
-            test_dataset = test_dataset,
-            model = model,
-            smpl_model = smpl_model,
-            metrics_engine = metrics_engine,
-            device = device,
-            vis=False,
-            epochs_ft=1,
-        )
-        for key, value in eval_result["qry_set_overall"].items():
-            writer.add_scalar(f"qry_set_overall/{key}", value, epoch)
-        if eval_result["qry_set_overall"]["MPJPE [mm]"] < best_mpjpe:
-            best_mpjpe = eval_result["qry_set_overall"]["MPJPE [mm]"]
+                        test_dataset = test_dataset,
+                        model = model,
+                        smpl_model = smpl_model,
+                        metrics_engine = metrics_engine,
+                        model_path = None,
+                        device = device,
+                        vis=False,
+                    )
+        for key, value in eval_result.items():
+            writer.add_scalar(f"Test/{key}", value, epoch)
+        if eval_result["MPJPE [mm]"] < best_mpjpe:
+            best_mpjpe = eval_result["MPJPE [mm]"]
             best_epoch = epoch
+            best_result = eval_result
 
             print('*****************Best model saved*****************')
             torch.save(model.state_dict(), osp.join(save_dir, "model.pth"))
     with open(osp.join(save_dir, "best_epoch.txt"), "w") as f:
-        f.write(f'The best epoch is {best_epoch}.')
+        f.write(f'The best epoch is {best_epoch}.\n')
+        f.write(json.dumps(best_result, indent=4, ensure_ascii=False))
 
 def test(
     test_dataset,
@@ -169,114 +167,83 @@ def test(
     model_path=None,
     device="cuda",
     vis=False,
-    epochs_ft=1,
-    batch_size=5,
-    eval_supp_set=False,
 ):
 
-    collate_fn = MetaCollate()
-    testloader = DataLoader(test_dataset, batch_size=1, collate_fn=collate_fn)
+    testloader = DataLoader(test_dataset, batch_size=1)
     if model_path is not None:
         model.load_state_dict(
             torch.load(osp.join(model_path, "model.pth"), map_location=device)
         )
 
-    if eval_supp_set:
-        eval_results = {
-            "supp_set": [],
-            "qry_set": []
-        }
-    else:
-        eval_results = {
-            "qry_set": []
-        }
-    for data in testloader:
-        supp_set = {key: value[0] for key, value in data[0].items()}
-        qry_set = {key: value[0] for key, value in data[1].items()}
-        # print('Begin finetuning')
-        B = supp_set["marker_info"].shape[0]
-        L = supp_set["marker_info"].shape[1]
-        ft_model = model.clone()
-        optimizer = optim.Adam(ft_model.parameters(), lr=5e-4)
+    model.eval()
+    eval_results = []
+    for data in tqdm(testloader):
+        B = data["marker_info"].shape[0]
+        L = data["marker_info"].shape[1]
+        x = data["marker_info"].contiguous().view(B, L, -1)
 
-        ft_model.train()
-        for e in range(epochs_ft):
-            for ft_i in range(B // batch_size):
-                optimizer.zero_grad()
-                x = (
-                    supp_set["marker_info"][batch_size * ft_i : (ft_i + 1) * batch_size]
-                    .contiguous()
-                    .view(batch_size, L, -1)
-                )
-                output = ft_model(x)
-                gt = {
-                    key: value[batch_size * ft_i : (ft_i + 1) * batch_size]
-                    for key, value in supp_set.items()
-                    if key != "task_name"
-                }
-                losses = loss_fn(output, gt, smpl_model)
-                losses["total_loss"].backward()
-                optimizer.step()
-
-        ft_model.eval()
-        if eval_supp_set:
-            eval_data = {
-                'supp_set': supp_set,
-                'qry_set': qry_set,
-                }
-        else:
-            eval_data = {
-                'qry_set': qry_set,
-            }
-        # evaluate the support/query set
-        for set_name, data in eval_data.items():
-            B = data["marker_info"].shape[0]
-            L = data["marker_info"].shape[1]
+        # 逐个sequence进行评估
+        if L>120:
+            n_slices = int(np.ceil(L/120))
             output_list = []
-            # 逐个sequence进行评估
-            for val_i in range(B):
-                x = data["marker_info"][val_i].contiguous().view(1, L, -1)
-                output = ft_model(x)
+            for i in range(n_slices):
+                if i == 0:
+                    is_new_sequence = True
+                else:
+                    is_new_sequence = False
+                chunk_x = x[:, 120*i:120*(i+1),:].contiguous()
+                seq_len = chunk_x.shape[1]
+                output = model(chunk_x, is_new_sequence=is_new_sequence)
+
                 output["joints"] = smpl_model(
-                    betas=output["betas"].reshape(-1),
-                    body_pose=output["poses"].reshape(L, -1)[:, 3:],
-                    global_orient=output["poses"].reshape(L, -1)[:, 0:3],
-                    transl=output["trans"].reshape(L, -1),
-                )["joints"].reshape(1, L, -1, 3)
+                betas=output["betas"].reshape(-1),
+                body_pose=output["poses"].reshape(seq_len, -1)[:, 3:],
+                global_orient=output["poses"].reshape(seq_len, -1)[:, 0:3],
+                transl=output["trans"].reshape(seq_len, -1),
+                )["joints"].reshape(1, seq_len, -1, 3)
+
                 output_list.append(output)
-                # 可视化当前sequence
-                if vis:
-                    vis_diff_aitviewer(
-                        "smpl",
-                        gt_full_poses=data["poses"][val_i],
-                        gt_betas=data["betas"][val_i],
-                        gt_trans=data["trans"][val_i],
-                        pred_full_poses=output["poses"].squeeze(),
-                        pred_betas=output["betas"].squeeze(),
-                        pred_trans=output["trans"].squeeze(),
-                    )
-            # 合并所有sequence的输出，一次性计算评估指标
-            outputs = {}
+            output = {}
             for key in output_list[0].keys():
-                outputs[key] = torch.concatenate([item[key] for item in output_list])
-            metrics = metrics_engine.compute(outputs, data)
-            print(
-                metrics_engine.to_pretty_string(
-                    metrics,
-                    f"Task {supp_set['task_name']}-{model.model_name()}-{set_name}",
-                )
+                if key == 'betas':
+                    output[key] = torch.mean(torch.stack([item[key].squeeze() for item in output_list]), dim=0)
+                else:
+                    output[key] = torch.concatenate([item[key] for item in output_list], dim=1)
+ 
+
+        else:
+            output = model(x, is_new_sequence=True)
+
+            output["joints"] = smpl_model(
+            betas=output["betas"].reshape(-1),
+            body_pose=output["poses"].reshape(L, -1)[:, 3:],
+            global_orient=output["poses"].reshape(L, -1)[:, 0:3],
+            transl=output["trans"].reshape(L, -1),
+            )["joints"].reshape(1, L, -1, 3)
+
+        
+        # 可视化当前sequence
+        if vis:
+            vis_diff_aitviewer(
+                "smpl",
+                gt_full_poses=data["poses"][0],
+                gt_betas=data["betas"][0],
+                gt_trans=data["trans"][0],
+                pred_full_poses=output["poses"][0],
+                pred_betas=output["betas"][0],
+                pred_trans=output["trans"][0],
             )
-            eval_results[set_name].append(metrics)
+        # 合并所有sequence的输出，一次性计算评估指标
+        
+        metrics = metrics_engine.compute(output, data)
+        eval_results.append(metrics)
 
     oa_results = {}
-    ret = {}
-    for key, item in eval_results.items():
-        for k in item[0].keys():
-            oa_results[k] = np.mean([i[k] for i in item])
-        print(metrics_engine.to_pretty_string(oa_results, f"Overall {model.model_name()}-{key}"))
-        ret[key + "_overall"] = oa_results
+    for key in eval_results[0].keys():
+        oa_results[key] = np.mean([item[key] for item in eval_results])
+    print(metrics_engine.to_pretty_string(oa_results, f"Overall {model.model_name()}"))
 
-    return ret
+    return oa_results
 
 
 def main(config):
@@ -285,11 +252,9 @@ def main(config):
     marker_type = config.marker_type if hasattr(config, "marker_type") else "moshpp"
     if marker_type == "moshpp":
         vid = [value for value in moshpp_marker_id.values()]
-        config.data_path = osp.join(config.data_path, "moshpp")
         input_dim = 3
     elif marker_type == "rbm":
         vid = [value for value in rigidbody_marker_id.values()]
-        config.data_path = osp.join(config.data_path, "rbm")
         input_dim = 6
     else:
         raise ValueError(f"未知的marker_type: {marker_type}")
@@ -315,7 +280,6 @@ def main(config):
             m_dropout=config.dropout if hasattr(config, "dropout") else 0.0,
             m_bidirectional=True,
             model_type=config.model_type,
-            only_pose=config.only_pose
         ).to(device)
     elif config.base_model == "frame":
         model = FrameModel(
@@ -326,18 +290,14 @@ def main(config):
             num_layers=config.num_layers,
             hidden_size=config.hidden_size,
             m_dropout=config.dropout if hasattr(config, "dropout") else 0.0,
-            only_pose=config.only_pose
         ).to(device)
     else:
         raise ValueError(f"未知的base_model: {config.base_model}")
 
     metrics_engine = MetricsEngine()
-    if config.only_pose:
-        train_fp = osp.join(config.data_path, "meta_train_data_with_normalize_betas_marker.pkl")
-        test_fp = osp.join(config.data_path, "meta_val_data_with_normalize_betas_marker.pkl")
-    else:
-        train_fp = osp.join(config.data_path, "metatrain.pkl")
-        test_fp = osp.join(config.data_path, "metatest.pkl")
+
+    train_fp = osp.join(config.data_path, "CMU_lmdb_"+config.marker_type)
+    test_fp = osp.join(config.data_path, "BMLrub_lmdb_"+config.marker_type)
 
 
     smpl_model = Smpl(
@@ -352,8 +312,8 @@ def main(config):
             os.mkdir(save_dir)
             with open(osp.join(save_dir, "config.json"), "w") as f:
                 json.dump(config.__dict__, f)
-        train_dataset = BabelDataset(train_fp, use_rela_x=config.use_rela_x, marker_type=config.marker_type, device=device)
-        test_dataset = MetaBabelDataset(test_fp, use_rela_x=config.use_rela_x, marker_type=config.marker_type, device=device)
+        train_dataset = AmassLmdbDataset(train_fp, use_rela_x=config.use_rela_x, marker_type=config.marker_type, device=device)
+        test_dataset = AmassLmdbDataset(test_fp, use_rela_x=config.use_rela_x, marker_type=config.marker_type, device=device)
         train(
             train_dataset,
             test_dataset,
@@ -370,7 +330,7 @@ def main(config):
     elif config.train_mode == "test":
         # 如果有指定测试目录则用，否则用当前save_dir
         assert config.model_path is not None, "model_path is required for test mode"
-        test_dataset = MetaBabelDataset(test_fp, use_rela_x=config.use_rela_x, marker_type=config.marker_type, device=device)
+        test_dataset = AmassLmdbDataset(test_fp, use_rela_x=config.use_rela_x, device=device)
         test_dir = config.model_path
     else:
         raise ValueError(f"未知的train_mode: {config.train_mode}")
@@ -384,8 +344,6 @@ def main(config):
         model_path = test_dir,
         device = device,
         vis=False,
-        epochs_ft=config.epochs_ft,
-        eval_supp_set=True
     )
 
     return
@@ -400,7 +358,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="data/mosr/",
+        default="data/",
         help="Path to dataset.",
     )
     parser.add_argument(
@@ -448,9 +406,7 @@ if __name__ == "__main__":
         choices=["rnn", "lstm", "gru", "cnn", "transformer"],
         help="Model type.",
     )
-    parser.add_argument(
-        "--only_pose", type=bool, default=False, help="Only predict pose."
-    )
+
     parser.add_argument(
         "--use_rela_x", type=bool, default=True, help="Use relative x."
     )
@@ -471,7 +427,7 @@ if __name__ == "__main__":
         "--epochs", type=int, default=1000, help="Number of epochs for pretraining."
     )
     parser.add_argument(
-        "--batch_size", type=int, default=5, help="Batch size for pretraining."
+        "--batch_size", type=int, default=15, help="Batch size for pretraining."
     )
 
     parser.add_argument("--lr", type=float, default=5e-4, help="Initial learning rate.")
@@ -491,7 +447,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--marker_type",
         type=str,
-        default="moshpp",
+        default="rbm",
         choices=["moshpp", "rbm"],
         help="Marker type.",
     )
