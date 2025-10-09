@@ -109,10 +109,10 @@ def train(
     scheduler = optim.lr_scheduler.StepLR(train_optimizer, step_size=epochs//10, gamma=0.8)
     global_step = 0
     print("Begin training.")
-    for epoch in range(epochs):
+    for epoch in tqdm(range(epochs)):
         model.train()
 
-        for data in tqdm(trainloader):
+        for data in trainloader:
             B = data["marker_info"].shape[0]
             L = data["marker_info"].shape[1]
             x = data["marker_info"].contiguous().view(B, L, -1)
@@ -136,7 +136,6 @@ def train(
         # scheduler.step()
 
         # evaluate the query set (support set)
-
         eval_result = test(
                         test_dataset = test_dataset,
                         model = model,
@@ -145,6 +144,7 @@ def train(
                         model_path = None,
                         device = device,
                         vis=False,
+                        val=True
                     )
         for key, value in eval_result.items():
             writer.add_scalar(f"Test/{key}", value, epoch)
@@ -167,9 +167,10 @@ def test(
     model_path=None,
     device="cuda",
     vis=False,
+    val=False
 ):
 
-    testloader = DataLoader(test_dataset, batch_size=1)
+    testloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     if model_path is not None:
         model.load_state_dict(
             torch.load(osp.join(model_path, "model.pth"), map_location=device)
@@ -177,10 +178,13 @@ def test(
 
     model.eval()
     eval_results = []
-    for data in tqdm(testloader):
+    for data_idx, data in enumerate(testloader):
         B = data["marker_info"].shape[0]
         L = data["marker_info"].shape[1]
         x = data["marker_info"].contiguous().view(B, L, -1)
+
+        if val and data_idx>=50:
+            break
 
         # 逐个sequence进行评估
         if L>120:
@@ -210,7 +214,6 @@ def test(
                 else:
                     output[key] = torch.concatenate([item[key] for item in output_list], dim=1)
  
-
         else:
             output = model(x, is_new_sequence=True)
 
