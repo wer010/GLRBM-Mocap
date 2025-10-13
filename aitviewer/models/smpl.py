@@ -208,7 +208,7 @@ class SMPLLayer(nn.Module, ABC):
             )
 
         # Batch shapes if they don't match batch dimension.
-        if len(betas.shape) == 1 or betas.shape[0] == 1:
+        if betas.shape[0] == 1:
             betas = betas.repeat(poses_body.shape[0], 1)
         betas = betas[:, : self.num_betas]
 

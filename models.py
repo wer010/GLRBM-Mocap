@@ -483,7 +483,7 @@ class SequenceModel(torch.nn.Module):
         elif model_type == 'transformer':
             self.pos_encoder = torch.nn.Parameter(torch.zeros(1, 300, self.hidden_size))  # 假设最大序列长度512
             torch.nn.init.normal_(self.pos_encoder, mean=0, std=0.02)
-            input_proj = torch.nn.Linear(self.input_size, self.hidden_size)
+            self.input_proj = torch.nn.Linear(self.input_size, self.hidden_size)
             # Transformer Encoder
             encoder_layer = torch.nn.TransformerEncoderLayer(
                 d_model=self.hidden_size,
@@ -497,7 +497,7 @@ class SequenceModel(torch.nn.Module):
                 encoder_layer,
                 num_layers=self.num_layers
             )
-            self.model = torch.nn.Sequential(input_proj, self.transformer_encoder)
+            self.model = torch.nn.Sequential(self.transformer_encoder)
             self.num_directions = 1
 
             
@@ -551,7 +551,9 @@ class SequenceModel(torch.nn.Module):
             out = self.model(inputs_)
             out = out.transpose(1, 2)
         elif self.model_type == 'transformer':
-            out = self.model(inputs_)
+            x = self.input_proj(inputs_) 
+            x = x + self.pos_encoder[:, :x.shape[1], :]
+            out = self.model(x)
         else:
             # Get the initial state of the recurrent cells.
             out, final_state = self.model(inputs_, self.init_state)

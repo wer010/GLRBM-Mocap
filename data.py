@@ -316,67 +316,6 @@ def convert_amass_to_lmdb(data_root, output_file, marker_type):
 
 
 
-def generate_marker_data(fp, marker_type = 'rbm', normalize_flags=[]):
-    if marker_type == 'rbm':
-        vid = [value for value in rigidbody_marker_id.values()]
-    elif marker_type == 'moshpp':
-        vid = [value for value in moshpp_marker_id.values()]
-
-    n_marker = len(vid)
-    device = 'cuda'
-    pos_offset = torch.tensor([0.0095, 0, 0, 1]).expand([n_marker, -1]).to(device)
-    ori_offset = torch.eye(3).expand([n_marker, -1, -1]).to(device)
-    vid_tensor = torch.tensor(vid).to(device)
-    dataset = MetaBabelDataset(fp, device=device)
-    save_data = {}
-    for t in range(len(dataset)):
-        print(f'{t}: Generate the marker for {dataset.task_id[int(t)]}')
-        data = dataset[t]
-
-        for k in normalize_flags:
-            data[k] = data[k]*0.0
-        marker_pos_list = []
-        marker_ori_list = []
-        joints_list = []
-        for i in range(len(data['betas'])):
-            frame_num = data['poses'][i].shape[0]
-            vid_tensor = vid_tensor.expand([frame_num, -1]).to(device)
-            marker_pos, marker_ori, v_posed, joints = virtual_marker(data['betas'][i],
-                                                                     data['poses'][i],
-                                                                     data['trans'][i],
-                                                                     vid_tensor,
-                                                                     pos_offset,
-                                                                     ori_offset,
-                                                                     visualize_flag=False)
-            marker_pos_list.append(marker_pos)
-            marker_ori_list.append(marker_ori)
-            joints_list.append(joints)
-
-        marker_pos = torch.stack(marker_pos_list)
-        marker_ori = torch.stack(marker_ori_list)
-        marker_ori = matrix_to_axis_angle(marker_ori)
-        if marker_type == 'rbm':
-            marker_info = torch.cat([marker_pos, marker_ori], dim=-1)
-        else:
-            marker_info = marker_pos
-        joints = torch.stack(joints_list)
-
-        ret = {'betas': data['betas'].detach().cpu(),
-               'poses': data['poses'].detach().cpu(),
-               'trans': data['trans'].detach().cpu(),
-               'marker_info': marker_info.detach().cpu(),
-               'joints': joints.detach().cpu()}
-        save_data[dataset.task_id[int(t)]] = ret
-
-    if len(normalize_flags) > 0:
-        s = '_normalize_'+ '_'.join(str(i) for i in normalize_flags)
-    else:
-        s = ''
-    file_name = fp.replace('.pkl', f'_with_{marker_type}{s}_marker.pkl')
-    with open(file_name, 'wb') as f:
-        pickle.dump(save_data, f)
-    return file_name
-
 def virtual_marker(betas, 
                    pose, 
                    trans, 

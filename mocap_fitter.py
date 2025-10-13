@@ -99,6 +99,7 @@ def train(
     device="cuda",
     lr=5e-4,
     epochs=400,
+    lr_decay = True
 ):
     writer = SummaryWriter(os.path.join(save_dir, "logs"))
     best_mpjpe = torch.inf
@@ -124,16 +125,15 @@ def train(
 
             losses = loss_fn(output, data, smpl_model)
             if writer is not None:
-                mode_prefix = "train"
                 for k in losses:
-                    prefix = "{}/{}".format(k, mode_prefix)
+                    prefix = f"Train_losses/{k}"
                     writer.add_scalar(prefix, losses[k].cpu().item(), global_step)
 
             writer.add_scalar("lr", scheduler.get_last_lr()[0], global_step)
             losses["total_loss"].backward()
             train_optimizer.step()
-
-        # scheduler.step()
+        if lr_decay:
+            scheduler.step()
 
         # evaluate the query set (support set)
         eval_result = test(
@@ -178,7 +178,7 @@ def test(
 
     model.eval()
     eval_results = []
-    for data_idx, data in enumerate(testloader):
+    for data_idx, data in enumerate(tqdm(testloader)):
         B = data["marker_info"].shape[0]
         L = data["marker_info"].shape[1]
         x = data["marker_info"].contiguous().view(B, L, -1)
@@ -210,7 +210,7 @@ def test(
             output = {}
             for key in output_list[0].keys():
                 if key == 'betas':
-                    output[key] = torch.mean(torch.stack([item[key].squeeze() for item in output_list]), dim=0)
+                    output[key] = torch.mean(torch.stack([item[key].squeeze() for item in output_list]), dim=0, keepdim=True)
                 else:
                     output[key] = torch.concatenate([item[key] for item in output_list], dim=1)
  
@@ -252,15 +252,28 @@ def test(
 def main(config):
     # 加载设备
     device = config.device if hasattr(config, "device") else "cuda"
-    marker_type = config.marker_type if hasattr(config, "marker_type") else "moshpp"
-    if marker_type == "moshpp":
+    # 根据测试文件夹下的config.json自动加载测试模式下的配置
+    if config.train_mode == "test":
+        json_path = osp.join(config.model_path, "config.json")
+        with open(json_path, "r") as f:
+            saved_config = json.load(f)
+        config.marker_type = saved_config["marker_type"]
+        config.base_model = saved_config["base_model"]
+        config.model_type = saved_config["model_type"]
+        config.use_rela_x = saved_config["use_rela_x"]
+        config.hidden_size = saved_config["hidden_size"]
+        config.num_layers = saved_config["num_layers"]
+        config.dropout = saved_config["dropout"]
+    
+    
+    if config.marker_type == "moshpp":
         vid = [value for value in moshpp_marker_id.values()]
         input_dim = 3
-    elif marker_type == "rbm":
+    elif config.marker_type == "rbm":
         vid = [value for value in rigidbody_marker_id.values()]
         input_dim = 6
     else:
-        raise ValueError(f"未知的marker_type: {marker_type}")
+        raise ValueError(f"未知的marker_type: {config.marker_type}")
     n_marker = len(vid)
 
     if config.use_rela_x:
@@ -272,6 +285,7 @@ def main(config):
     save_dir = osp.join("./results", f'{datetime.now().strftime("%Y%m%d-%H%M")}-{config.base_model}-{config.train_mode}-{config.marker_type}-{config.epochs}epochs')
 
     # 根据配置选择模型
+
     if config.base_model == "sequence":
         model = SequenceModel(
             input_size=input_dim,
@@ -328,12 +342,13 @@ def main(config):
             device=device,
             lr=config.lr,
             epochs=config.epochs,
+            lr_decay=config.lr_decay
         )
         test_dir = save_dir
     elif config.train_mode == "test":
-        # 如果有指定测试目录则用，否则用当前save_dir
+        # test 模式下必须指定测试目录
         assert config.model_path is not None, "model_path is required for test mode"
-        test_dataset = AmassLmdbDataset(test_fp, use_rela_x=config.use_rela_x, device=device)
+        test_dataset = AmassLmdbDataset(test_fp, use_rela_x=config.use_rela_x, marker_type=config.marker_type, device=device)
         test_dir = config.model_path
     else:
         raise ValueError(f"未知的train_mode: {config.train_mode}")
@@ -434,8 +449,12 @@ if __name__ == "__main__":
     )
 
     parser.add_argument("--lr", type=float, default=5e-4, help="Initial learning rate.")
+
     parser.add_argument(
-        "--weight_decay", type=float, default=1e-5, help="Weight decay for optimizer."
+        "--lr_decay",
+        type=bool,
+        default=True,
+        help="Whether to use learning rate decay.",
     )
     parser.add_argument(
         "--lr_scheduler",
