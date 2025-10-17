@@ -426,7 +426,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--use_rela_x", type=bool, default=True, help="Use relative x."
+        "--use_rela_x", action="store_true", help="Use relative x."
     )
     parser.add_argument(
         "--hidden_size", type=int, default=256, help="Hidden size for RNN/MLP layers."
@@ -451,10 +451,9 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=5e-4, help="Initial learning rate.")
 
     parser.add_argument(
-        "--lr_decay",
-        type=bool,
-        default=True,
-        help="Whether to use learning rate decay.",
+    "--lr_decay",
+    action="store_true",
+    help="Use learning rate decay."    
     )
     parser.add_argument(
         "--lr_scheduler",
