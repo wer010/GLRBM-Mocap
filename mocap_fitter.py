@@ -55,17 +55,20 @@ def geodesic_loss(aa1, aa2):
     return torch.mean(distance)
 
 
-def loss_fn(output, gt, smpl_model=None, do_fk=True):
+def loss_fn(output, gt, smpl_model=None, do_fk=True, use_geodesic_loss=True):
     B = output["poses"].shape[0]
     L = output["poses"].shape[1]
     device = output["poses"].device
 
     mse_loss = torch.nn.MSELoss()
     l1_loss = torch.nn.L1Loss()
-    pose_loss = mse_loss(output["poses"], gt["poses"])
+
     shape_loss = l1_loss(output["betas"].view(B, -1), gt["betas"])
     tran_loss = mse_loss(output["trans"], gt["trans"])
-    angle_loss = geodesic_loss(output["poses"].reshape(B, L, -1, 3), gt["poses"].reshape(B, L, -1, 3))
+    if use_geodesic_loss:
+        pose_loss = geodesic_loss(output["poses"].reshape(B, L, -1, 3), gt["poses"].reshape(B, L, -1, 3))
+    else:
+        pose_loss = mse_loss(output["poses"].reshape(B, L, -1, 3), gt["poses"].reshape(B, L, -1, 3))
     if do_fk:
         joints_hat = smpl_model(
             betas=output["betas"].expand(-1, L, -1).reshape(B * L, -1),
@@ -76,10 +79,10 @@ def loss_fn(output, gt, smpl_model=None, do_fk=True):
         fk_loss = mse_loss(joints_hat, gt["joints"])
     else:
         fk_loss = torch.zeros(1, device=device)
-    total_loss = angle_loss + shape_loss + tran_loss + 0.1 * fk_loss
+    total_loss = pose_loss + shape_loss + tran_loss + 0.1 * fk_loss
 
     losses = {
-        "pose": angle_loss,
+        "pose": pose_loss,
         "shape": shape_loss,
         "tran": tran_loss,
         "fk": fk_loss,
@@ -99,7 +102,8 @@ def train(
     device="cuda",
     lr=5e-4,
     epochs=400,
-    lr_decay = True
+    lr_decay = True,
+    use_geodesic_loss = True
 ):
     writer = SummaryWriter(os.path.join(save_dir, "logs"))
     best_mpjpe = torch.inf
@@ -123,7 +127,7 @@ def train(
 
             output = model(x)
 
-            losses = loss_fn(output, data, smpl_model)
+            losses = loss_fn(output, data, smpl_model, use_geodesic_loss=use_geodesic_loss)
             if writer is not None:
                 for k in losses:
                     prefix = f"Train_losses/{k}"
@@ -342,18 +346,29 @@ def main(config):
             device=device,
             lr=config.lr,
             epochs=config.epochs,
-            lr_decay=config.lr_decay
+            lr_decay=config.lr_decay,
+            use_geodesic_loss=config.use_geodesic_loss
         )
         test_dir = save_dir
     elif config.train_mode == "test":
         # test 模式下必须指定测试目录
         assert config.model_path is not None, "model_path is required for test mode"
+        train_dataset = AmassLmdbDataset(train_fp, use_rela_x=config.use_rela_x, marker_type=config.marker_type, device=device)
         test_dataset = AmassLmdbDataset(test_fp, use_rela_x=config.use_rela_x, marker_type=config.marker_type, device=device)
         test_dir = config.model_path
     else:
         raise ValueError(f"未知的train_mode: {config.train_mode}")
 
-    # 测试模型
+    # 分别在train和test数据集上测试模型
+    test(
+        test_dataset = train_dataset,
+        model = model,
+        smpl_model = smpl_model,
+        metrics_engine = metrics_engine,
+        model_path = test_dir,
+        device = device,
+        vis=False,
+    )
     test(
         test_dataset = test_dataset,
         model = model,
@@ -429,6 +444,10 @@ if __name__ == "__main__":
         "--use_rela_x", action="store_true", help="Use relative x."
     )
     parser.add_argument(
+        "--use_geodesic_loss", action="store_true", help="Use geodesic loss.",
+    )
+    
+    parser.add_argument(
         "--hidden_size", type=int, default=256, help="Hidden size for RNN/MLP layers."
     )
     parser.add_argument(
@@ -463,7 +482,7 @@ if __name__ == "__main__":
         help="Learning rate scheduler type.",
     )
 
-    
+
     # Input data.
     parser.add_argument(
         "--marker_type",
