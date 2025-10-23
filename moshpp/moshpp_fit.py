@@ -5,6 +5,10 @@ from datetime import timedelta
 import numpy as np
 import torch
 import sys
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from loguru import logger
 logger.remove()  # 移除默认 handler
 logger.add(sys.stderr, level="INFO")
@@ -560,7 +564,7 @@ def main():
     env = lmdb.open(
         output_lmdb_path,
         map_size=10 * 1024 ** 3,  # 预留 50GB，可按需要调整
-        subdir=False,
+        subdir=True,
         readonly=False,
         lock=True,
         readahead=False,
