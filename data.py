@@ -229,9 +229,7 @@ def convert_amass_to_lmdb(data_root, output_file, marker_type):
 
     print("Converting AMASS data under {} and exporting it to {} ...".format(data_root, output_file))
 
-    
     npz_file_ids = glob(osp.join(data_root, '*',  '*stageii.npz'))
-
 
     env = lmdb.open(output_file, map_size=10*1024**3)
     with env.begin(write=True) as txn:
@@ -328,7 +326,7 @@ def virtual_marker(betas,
     :param betas: shape (10)
     :param pose: shape (n,24*3)
     :param trans: shape (n,3)
-    :param vid: shape (n, m) m is the num of markers
+    :param vid: shape (m) m is the num of markers
     :param pos_offset: (m, 4)
     :param ori_offset: (m, 3, 3)
     :return:

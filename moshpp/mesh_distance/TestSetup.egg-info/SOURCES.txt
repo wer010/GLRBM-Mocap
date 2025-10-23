@@ -1,0 +1,6 @@
+setup.py
+/tmp/tmp9_tnus_l.c
+TestSetup.egg-info/PKG-INFO
+TestSetup.egg-info/SOURCES.txt
+TestSetup.egg-info/dependency_links.txt
+TestSetup.egg-info/top_level.txt

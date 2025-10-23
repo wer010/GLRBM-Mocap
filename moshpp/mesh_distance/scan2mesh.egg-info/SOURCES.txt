@@ -1,0 +1,7 @@
+sample2meshdist.pyx
+setup.py
+scan2mesh.egg-info/PKG-INFO
+scan2mesh.egg-info/SOURCES.txt
+scan2mesh.egg-info/dependency_links.txt
+scan2mesh.egg-info/requires.txt
+scan2mesh.egg-info/top_level.txt
