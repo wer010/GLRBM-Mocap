@@ -272,10 +272,10 @@ def main(config):
     
     
     if config.marker_type == "moshpp":
-        vid = [value for value in moshpp_marker_id.values()]
+        vid = np.array([value for value in moshpp_marker_id.values()], dtype=np.int32)
         input_dim = 3
     elif "rbm" in config.marker_type:
-        vid = [value for value in rigidbody_marker_id.values()]
+        vid = np.array([value for value in rigidbody_marker_id.values()], dtype=np.int32)
         input_dim = 6
         if config.marker_type == "rbm_a":
             vid = vid[rbm_a_config]
