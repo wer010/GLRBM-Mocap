@@ -327,8 +327,12 @@ def main(config):
 
     metrics_engine = MetricsEngine()
 
-    train_fp = osp.join(config.data_path, "CMU_lmdb_"+config.marker_type)
-    test_fp = osp.join(config.data_path, "BMLrub_lmdb_"+config.marker_type)
+    if "rbm" in config.marker_type:
+        fp_tail = 'rbm'
+    else:
+        fp_tail = 'moshpp'
+    train_fp = osp.join(config.data_path, "CMU_lmdb_"+fp_tail)
+    test_fp = osp.join(config.data_path, "BMLrub_lmdb_"+fp_tail)
 
 
     smpl_model = Smpl(
