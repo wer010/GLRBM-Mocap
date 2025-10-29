@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import time
 from copy import deepcopy
@@ -506,7 +507,6 @@ def mosh_stageii_chumpy(x, stagei_data) -> dict:
         perframe_data['markers_obs'].append(markers_obs)
         perframe_data['fullpose'].append(opt_model.fullpose.r.copy())
         perframe_data['trans'].append(opt_model.trans.r.copy())
-        perframe_data['joints'].append(opt_model.trans.r.copy())
 
 
 
@@ -547,13 +547,13 @@ class MoSh:
         return stageii_data
 
 
-def main():
+def worker(rank, total_parts):
     """
     This function should be self-contained; i.e. module imports should all be inside
     :param cfg:
     :return:
     """
-    metrics_engine = MetricsEngine()
+    print(f'Proc {rank} start.')
     mp = MoSh()
     test_fp = '/home/lanhai/PycharmProjects/GLRBM-Mocap/data/BMLrub_lmdb_moshpp'
     output_lmdb_path = '/home/lanhai/PycharmProjects/GLRBM-Mocap/data/BMLrub_lmdb_moshpp_results'
@@ -574,13 +574,18 @@ def main():
     with env.begin(write=True) as txn:
         txn.put(b"__info__", pickle.dumps({"description": "Mosh++ processed sequences"}))
 
-    for data_idx, data in enumerate(tqdm(testloader)):
+    for data_idx, data in enumerate(tqdm(testloader, position=rank, desc=f'Proc {rank}', leave=True)):
         key = f"{data_idx:06d}".encode("ascii")
+
+        if data_idx % total_parts != rank:
+            continue
 
         # 检查是否已存在，避免重复计算
         with env.begin(write=False) as txn:
             if txn.get(key) is not None:
                 continue
+        
+        
 
         B = data["marker_info"].shape[0]
         L = data["marker_info"].shape[1]
@@ -600,10 +605,10 @@ def main():
             txn.put(key, value)
 
         # 可选：每隔 N 条提交一次（提升性能）
-        if data_idx % 50 == 0:
+        if data_idx % 5 == 0:
             env.sync()
         # print(stageii_data)
-        # vis_diff_aitviewer(
+        # vis_diff_aitviewer(z
         #     "smpl",
         #     gt_full_poses=data["poses"][0],
         #     gt_betas=data["betas"][0],
@@ -616,4 +621,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    multiprocessing.set_start_method('spawn',force=True)
+    total_parts = 4
+    procs = [
+        multiprocessing.Process(target=worker, args=(r, total_parts))
+        for r in range(total_parts)
+    ]
+    [p.start() for p in procs]
+    [p.join() for p in procs]

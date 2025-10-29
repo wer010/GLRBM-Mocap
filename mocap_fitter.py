@@ -5,7 +5,7 @@ import numpy as np
 import argparse
 import json
 import os.path as osp
-from data import rigidbody_marker_id, moshpp_marker_id, virtual_marker, AmassLmdbDataset, train_collate_fn
+from data import rigidbody_marker_id, moshpp_marker_id, virtual_marker, AmassLmdbDataset, train_collate_fn, rbm_a_config, rbm_b_config, rbm_c_config, rbm_d_config
 from torch.utils.data import DataLoader, random_split
 from models import Moshpp, FrameModel, SequenceModel
 from metric import MetricsEngine
@@ -18,6 +18,7 @@ from tensorboardX import SummaryWriter
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(True)
+
 
 
 def geodesic_loss(aa1, aa2):
@@ -273,9 +274,18 @@ def main(config):
     if config.marker_type == "moshpp":
         vid = [value for value in moshpp_marker_id.values()]
         input_dim = 3
-    elif config.marker_type == "rbm":
+    elif "rbm" in config.marker_type:
         vid = [value for value in rigidbody_marker_id.values()]
         input_dim = 6
+        if config.marker_type == "rbm_a":
+            vid = vid[rbm_a_config]
+            input_dim = 6
+        elif config.marker_type == "rbm_b":
+            vid = vid[rbm_b_config]
+        elif config.marker_type == "rbm_c":
+            vid = vid[rbm_c_config]
+        elif config.marker_type == "rbm_d":
+            vid = vid[rbm_d_config]
     else:
         raise ValueError(f"未知的marker_type: {config.marker_type}")
     n_marker = len(vid)
@@ -488,7 +498,7 @@ if __name__ == "__main__":
         "--marker_type",
         type=str,
         default="rbm",
-        choices=["moshpp", "rbm"],
+        choices=["moshpp", "rbm", "rbm_a", "rbm_b", "rbm_c", "rbm_d"],
         help="Marker type.",
     )
 

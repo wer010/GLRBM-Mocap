@@ -16,21 +16,21 @@ from pytorch3d.transforms import matrix_to_axis_angle, axis_angle_to_quaternion,
 import lmdb
 
 rigidbody_marker_id = {
-    "head": 335,
-    "chest": 3073,
-    "left_arm": 2821,
-    "left_forearm": 1591,
-    "left_hand": 2000,
-    "left_leg": 981,
-    "left_shin": 1115,
-    "left_foot": 3341,
+    "head": 335,          # 0
+    "chest": 3073,        # 1
+    "left_arm": 2821,     # 2
+    "left_forearm": 1591, # 3
+    "left_hand": 2000,    # 4
+    "left_leg": 981,      # 5
+    "left_shin": 1115,    # 6
+    "left_foot": 3341,    # 7
     # "left_hip":809,
-    "right_arm": 4794,
-    "right_forearm": 5059,
-    "right_hand": 5459,
-    "right_leg": 4465,
-    "right_shin": 4599,
-    "right_foot": 6742,
+    "right_arm": 4794,    # 8
+    "right_forearm": 5059,# 9
+    "right_hand": 5459,   # 10
+    "right_leg": 4465,    # 11
+    "right_shin": 4599,   # 12
+    "right_foot": 6742,   # 13
     # "right_hip":4297
 }
 rbm_parent = [1,-1,1,2,3,1,5,6,
@@ -91,19 +91,41 @@ moshpp_marker_id = {
     "T10": 3016,
 }
 
+rbm_a_config = [0,1,3,4,6,7,9,10,12,13]
+rbm_a_parent = [1,-1,1,2,1,4,1,6,1,8]
+
+rbm_b_config = [0,1,2,4,5,7,8,10,11,13]
+rbm_b_parent = [1,-1,1,2,1,4,1,6,1,8]
+
+rbm_c_config = [0,1,2,3,5,6,8,9,11,12]
+rbm_c_parent = [1,-1,1,2,1,4,1,6,1,8]
+
+rbm_d_config = [0,1,4,7,10,13]
+rbm_d_parent = [1,-1,1,1,1,1]
+
+
 def rela_x_fn(x, marker_type = 'moshpp'):
     if marker_type == 'moshpp':
         x_c = torch.mean(x, dim = -2, keepdim=True)
         x_rela = x - x_c
         ret = torch.concatenate([x_c, x_rela], dim = -2)
-    elif marker_type == 'rbm':
+    elif "rbm" in marker_type:
         x_pos = x[..., :3]
         x_ori = x[..., 3:]
         pos_center = torch.mean(x_pos, dim = -2, keepdim=True)
         rel_pos = x_pos - pos_center
 
         quat_ori = axis_angle_to_quaternion(x_ori)
-        rbm_parent_tensor = torch.tensor(rbm_parent, dtype=torch.int).to(x.device)
+        if marker_type == 'rbm':
+            rbm_parent_tensor = torch.tensor(rbm_parent, dtype=torch.int).to(x.device)
+        elif marker_type == 'rbm_a':
+            rbm_parent_tensor = torch.tensor(rbm_a_parent, dtype=torch.int).to(x.device)
+        elif marker_type == 'rbm_b':
+            rbm_parent_tensor = torch.tensor(rbm_b_parent, dtype=torch.int).to(x.device)
+        elif marker_type == 'rbm_c':
+            rbm_parent_tensor = torch.tensor(rbm_c_parent, dtype=torch.int).to(x.device)
+        elif marker_type == 'rbm_d':
+            rbm_parent_tensor = torch.tensor(rbm_d_parent, dtype=torch.int).to(x.device)
         quat_ori_parent = quat_ori[..., rbm_parent_tensor,:]
         identity = quat_ori_parent.new_tensor([1, 0, 0, 0])
         quat_ori_parent[...,1,:] = identity
@@ -164,8 +186,16 @@ class AmassLmdbDataset(Dataset):
         with env.begin(write=False) as txn:
             value = txn.get(key)
         data = pickle.loads(value)
-        if self.marker_type == 'rbm':
+        if 'rbm' in self.marker_type:
             marker_info = torch.cat([data['marker_pos'], data['marker_ori']], dim=-1)
+            if self.marker_type == 'rbm_a':
+                marker_info = marker_info[:,rbm_a_config,:]
+            elif self.marker_type == 'rbm_b':
+                marker_info = marker_info[:,rbm_b_config,:]
+            elif self.marker_type == 'rbm_c':
+                marker_info = marker_info[:,rbm_c_config,:]
+            elif self.marker_type == 'rbm_d':
+                marker_info = marker_info[:,rbm_d_config,:]
         else:
             marker_info = data['marker_pos']
         if self.use_rela_x:
@@ -313,7 +343,6 @@ def convert_amass_to_lmdb(data_root, output_file, marker_type):
         txn.put('__len__'.encode(), "{}".format(valid_i).encode())
 
 
-
 def virtual_marker(betas, 
                    pose, 
                    trans, 
@@ -368,4 +397,3 @@ if __name__ == '__main__':
 
     # convert_amass_to_lmdb(data_root='data/BMLrub', output_file='data/BMLrub_lmdb', marker_type='rbm')
     # convert_amass_to_lmdb(data_root='data/BMLrub', output_file='data/BMLrub_lmdb', marker_type='moshpp')
-    
