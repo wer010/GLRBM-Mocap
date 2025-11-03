@@ -14,20 +14,22 @@ from loguru import logger
 logger.remove()  # 移除默认 handler
 logger.add(sys.stderr, level="INFO")
 from tqdm import tqdm
-import chumpy as ch
+# import chumpy as ch
 from sklearn.neighbors import NearestNeighbors
-from smpl_fast_derivatives import load_moshpp_models
-from transformed_lm import TransformedCoeffs, TransformedLms
+# from smpl_fast_derivatives import load_moshpp_models
+# from transformed_lm import TransformedCoeffs, TransformedLms
+# from mesh_distance_main import PtsToMesh
+
 from data import virtual_marker, moshpp_marker_id, AmassLmdbDataset
-from mesh_distance_main import PtsToMesh
 from torch.utils.data import DataLoader
-from psbody.mesh import Mesh
+# from psbody.mesh import Mesh
 import cv2
 import scipy
 from utils import vis_diff_aitviewer
 from metric import MetricsEngine
 import lmdb
 import pickle
+from smpl import Smpl
 
 def rigid_landmark_transform(a, b):
     """
@@ -621,11 +623,55 @@ def worker(rank, total_parts):
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method('spawn',force=True)
-    total_parts = 4
-    procs = [
-        multiprocessing.Process(target=worker, args=(r, total_parts))
-        for r in range(total_parts)
-    ]
-    [p.start() for p in procs]
-    [p.join() for p in procs]
+    # multiprocessing.set_start_method('spawn',force=True)
+    # total_parts = 4
+    # procs = [
+    #     multiprocessing.Process(target=worker, args=(r, total_parts))
+    #     for r in range(total_parts)
+    # ]
+    # [p.start() for p in procs]
+    # [p.join() for p in procs]
+
+    device = 'cuda'
+    smpl_model = Smpl(
+            model_path='/home/lanhai/PycharmProjects/GLRBM-Mocap/data/models/smpl/SMPL_NEUTRAL.npz',
+            device=device,
+        )
+    metrics_engine = MetricsEngine()
+    test_fp = '/home/lanhai/PycharmProjects/GLRBM-Mocap/data/BMLrub_lmdb_moshpp'
+
+    test_dataset = AmassLmdbDataset(test_fp, use_rela_x=False, marker_type='moshpp', device=device)
+    testloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+
+    results_fp = '/home/lanhai/PycharmProjects/GLRBM-Mocap/data/BMLrub_lmdb_moshpp_results'
+    env = lmdb.open(results_fp, readonly=True, lock=False)
+    eval_results = []
+    for data_idx, data in enumerate(tqdm(testloader)):
+        B = data["marker_info"].shape[0]
+        L = data["marker_info"].shape[1]
+        key = f"{data_idx:06d}".encode("ascii")
+        with env.begin(write=False) as txn:
+            value = txn.get(key)
+        result = pickle.loads(value)
+
+        joints = smpl_model(
+            betas=torch.from_numpy(result["betas"][:10]).float().reshape(-1).to(device),
+            body_pose=torch.from_numpy(result["fullpose"][:, 3:]).float().reshape( L, -1).to(device),
+            global_orient=torch.from_numpy(result["fullpose"][:, :3]).float().reshape(L, -1).to(device),
+            transl=torch.from_numpy(result["trans"]).float().reshape(L, -1).to(device),
+        )["joints"]
+        
+        res = {
+            "poses": torch.from_numpy(result["fullpose"]).reshape(1, L, -1).to(device),
+            "betas": torch.from_numpy(result["betas"][:10]).reshape(1, -1).to(device),
+            "trans": torch.from_numpy(result["trans"]).reshape(1, L, -1).to(device),
+            "joints": joints.reshape(1, L, -1, 3),
+        }
+
+        metrics = metrics_engine.compute(res, data)
+        eval_results.append(metrics)
+    oa_results = {}
+
+    for key in eval_results[0].keys():
+        oa_results[key] = np.mean([item[key] for item in eval_results])
+    print(metrics_engine.to_pretty_string(oa_results, f"Overall Smpl"))

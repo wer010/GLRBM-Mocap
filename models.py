@@ -1,3 +1,4 @@
+from functools import partial
 import numpy as np
 import torch
 import copy
@@ -10,6 +11,9 @@ from pytorch3d.ops.knn import  knn_points
 import torch.nn.functional as F
 from utils import visualize
 import math
+from timm.models.vision_transformer_relpos import RelPosAttention
+# for 2D fallback path in RelPosMlp
+from timm.layers.mlp import Mlp
 
 class StageOneFitter(torch.nn.Module):
     def __init__(self,
@@ -243,6 +247,96 @@ class Moshpp(torch.nn.Module):
         output['marker_pos'] = m
         
         return output   
+
+class RelPosMlp(torch.nn.Module):
+    """ Log-Coordinate Relative Position MLP
+    Based on ideas presented in Swin-V2 paper (https://arxiv.org/abs/2111.09883)
+
+    This impl covers the 'swin' implementation as well as two timm specific modes ('cr', and 'rw')
+    """
+    def __init__(
+            self,
+            num_heads: int = 4,
+            hidden_dim: int = 128,
+ 
+            device='cuda',
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
+ 
+        self.num_heads = num_heads
+        self.device = 'cuda'
+
+        self.mlp = Mlp(
+            1,  # x, y
+            hidden_features=hidden_dim,
+            out_features=num_heads,
+            act_layer=torch.nn.ReLU,
+            bias=True,
+            **dd,
+        )
+    def gen_rel_coords_log(self, L):
+        pos = torch.arange(L, device=self.device).to(torch.float32)
+        rel_coords = pos[None, :].expand(L, -1)
+        rel_coords = torch.abs(rel_coords - pos[:, None])
+        return torch.exp(-1*rel_coords)
+
+    def forward(self, attn, shared_rel_pos):
+        B,H,L,_ = attn.shape
+        rel_coords_log = self.gen_rel_coords_log(L).reshape(L, L, 1)
+        return attn +  self.mlp(rel_coords_log).permute(2,0,1)[None, ...]
+
+    def get_bias(self):
+        return None
+
+class RelPosBlock(torch.nn.Module):
+
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int,
+            mlp_ratio: float = 4.,
+            qkv_bias = True,
+            qk_norm = False,
+            proj_drop = 0.,
+            attn_drop = 0.,
+            drop_path = 0.,
+            act_layer = torch.nn.GELU,
+            norm_layer = torch.nn.LayerNorm,
+            device=None,
+            dtype=None,
+    ):
+        dd = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.norm1 = norm_layer(dim, **dd)
+        self.attn = RelPosAttention(
+            dim,
+            num_heads,
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
+            rel_pos_cls=RelPosMlp,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            norm_layer=norm_layer,
+            **dd,
+        )
+        self.attn.fused_attn = False
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+
+        self.norm2 = norm_layer(dim, **dd)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=proj_drop,
+            **dd,
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 
 class LinearLayers(torch.nn.Module):
@@ -481,23 +575,32 @@ class SequenceModel(torch.nn.Module):
             self.model = torch.nn.Sequential(*conv_layers)
             self.num_directions = 1
         elif model_type == 'transformer':
-            self.pos_encoder = torch.nn.Parameter(torch.zeros(1, 300, self.hidden_size))  # 假设最大序列长度512
-            torch.nn.init.normal_(self.pos_encoder, mean=0, std=0.02)
             self.input_proj = torch.nn.Linear(self.input_size, self.hidden_size)
+
+            # self.pos_encoder = torch.nn.Parameter(torch.zeros(1, 300, self.hidden_size))  # 假设最大序列长度512
+            # torch.nn.init.normal_(self.pos_encoder, mean=0, std=0.02)
             # Transformer Encoder
-            encoder_layer = torch.nn.TransformerEncoderLayer(
-                d_model=self.hidden_size,
-                nhead=4,
-                dim_feedforward=self.hidden_size * 2,
-                dropout=m_dropout,
-                activation='relu',
-                batch_first=True
+            # encoder_layer = torch.nn.TransformerEncoderLayer(
+            #     d_model=self.hidden_size,
+            #     nhead=4,
+            #     dim_feedforward=self.hidden_size * 2,
+            #     dropout=m_dropout,
+            #     activation='relu',
+            #     batch_first=True
+            # )
+            # self.transformer_encoder = torch.nn.TransformerEncoder(
+            #     encoder_layer,
+            #     num_layers=self.num_layers
+            # )
+            self.blocks = torch.nn.ModuleList([
+            RelPosBlock(
+                dim=self.hidden_size,
+                num_heads=4,
+                mlp_ratio=2,
             )
-            self.transformer_encoder = torch.nn.TransformerEncoder(
-                encoder_layer,
-                num_layers=self.num_layers
-            )
-            self.model = torch.nn.Sequential(self.transformer_encoder)
+            for i in range(self.num_layers)])
+            self.model = torch.nn.Sequential(*self.blocks)
+            # self.model = torch.nn.Sequential(transformer_encoder)
             self.num_directions = 1
 
             
@@ -552,7 +655,7 @@ class SequenceModel(torch.nn.Module):
             out = out.transpose(1, 2)
         elif self.model_type == 'transformer':
             x = self.input_proj(inputs_) 
-            x = x + self.pos_encoder[:, :x.shape[1], :]
+            # x = x + self.pos_encoder[:, :x.shape[1], :]
             out = self.model(x)
         else:
             # Get the initial state of the recurrent cells.

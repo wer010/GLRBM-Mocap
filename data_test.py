@@ -2,7 +2,7 @@ import lmdb
 from data import AmassLmdbDataset
 from tqdm import tqdm
 
-data_path = 'data/BMLrub_lmdb_moshpp_results'
+data_path = 'data/CMU_lmdb_moshpp'
 
 # dataset = AmassLmdbDataset(data_path, use_rela_x=False, marker_type='rbm', device='cuda')
 
