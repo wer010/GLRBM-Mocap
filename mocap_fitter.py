@@ -160,10 +160,8 @@ def train(
 
             print('*****************Best model saved*****************')
             torch.save(model.state_dict(), osp.join(save_dir, "model.pth"))
-    with open(osp.join(save_dir, "best_epoch.txt"), "w") as f:
-        f.write(f'The best epoch is {best_epoch}.\n')
-        f.write(json.dumps(best_result, indent=4, ensure_ascii=False))
-
+    return best_epoch
+    
 def test(
     test_dataset,
     model,
@@ -349,7 +347,7 @@ def main(config):
                 json.dump(config.__dict__, f)
         train_dataset = AmassLmdbDataset(train_fp, use_rela_x=config.use_rela_x, marker_type=config.marker_type, device=device)
         test_dataset = AmassLmdbDataset(test_fp, use_rela_x=config.use_rela_x, marker_type=config.marker_type, device=device)
-        train(
+        best_epoch = train(
             train_dataset,
             test_dataset,
             model,
@@ -374,7 +372,7 @@ def main(config):
         raise ValueError(f"未知的train_mode: {config.train_mode}")
 
     # 分别在train和test数据集上测试模型
-    test(
+    train_result = test(
         test_dataset = train_dataset,
         model = model,
         smpl_model = smpl_model,
@@ -383,7 +381,7 @@ def main(config):
         device = device,
         vis=False,
     )
-    test(
+    test_result = test(
         test_dataset = test_dataset,
         model = model,
         smpl_model = smpl_model,
@@ -392,6 +390,14 @@ def main(config):
         device = device,
         vis=False,
     )
+
+    with open(osp.join(save_dir, "best_epoch.txt"), "w") as f:
+        f.write(f'The best epoch is {best_epoch}.\n')
+        f.write("Train result:\n")
+        f.write(json.dumps(train_result, indent=4, ensure_ascii=False))
+        f.write("Test result:\n")
+        f.write(json.dumps(test_result, indent=4, ensure_ascii=False))
+
 
     return
 
