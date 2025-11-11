@@ -5,6 +5,7 @@ import copy
 import os.path as osp
 from loguru import logger
 from omegaconf import OmegaConf
+import continuity_tools
 from smpl import Smpl
 from geo_utils import estimate_lcs_with_curv, estimate_lcs_with_faces, invert_se3, rigid_landmark_transform_batch
 from pytorch3d.ops.knn import  knn_points
@@ -417,6 +418,205 @@ class MLP(torch.nn.Module):
         y = self.hidden_layers(y)
         y = self.hidden_to_output(y)
         return y
+
+
+class ContinuitySequenceModel(torch.nn.Module):
+
+    def __init__(self,
+                 input_size,
+                 betas_size,
+                 poses_size,
+                 trans_size,
+                 num_layers,
+                 hidden_size,
+                 m_dropout = 0,
+                 model_type = 'gru',
+                 m_bidirectional= True,
+                 rotation_mode = 'ortho6d'):
+        super(ContinuitySequenceModel, self).__init__()
+        self.input_size = input_size
+        self.betas_size = betas_size
+        self.rotation_mode = rotation_mode
+        self.num_joints = poses_size // 3
+        if rotation_mode == 'ortho6d':
+            self.poses_size = 6 * self.num_joints
+        elif rotation_mode == 'quaternion':
+            self.poses_size = 4 * self.num_joints
+        elif rotation_mode == 'axisangle':
+            self.poses_size = 3 * self.num_joints
+        elif rotation_mode == 'rotmat':
+            self.poses_size = 3 * 3 * self.num_joints
+        else:
+            self.poses_size = poses_size
+        self.trans_size = trans_size
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
+        self._init_args = dict(
+            input_size=input_size,
+            betas_size=betas_size,
+            poses_size=poses_size,
+            trans_size=trans_size,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            m_dropout=m_dropout,
+            m_bidirectional=m_bidirectional,
+            model_type=model_type,
+        )
+        self.is_bidirectional = m_bidirectional
+        self.num_directions = 2 if m_bidirectional else 1
+        self.model_type = model_type
+        self.learn_init_state = True
+
+
+        if m_dropout > 0.0:
+            self.input_drop = torch.nn.Dropout(p=m_dropout)
+        else:
+            self.input_drop = torch.nn.Identity()
+
+        self.init_state = None
+        self.final_state = None
+        if model_type != 'cnn' and self.learn_init_state:
+            self.to_init_state_h = torch.nn.Linear(self.input_size, self.hidden_size * self.num_layers * self.num_directions)
+            self.to_init_state_c = torch.nn.Linear(self.input_size, self.hidden_size * self.num_layers * self.num_directions)
+
+        if model_type == 'lstm':
+            self.model = torch.nn.LSTM(self.input_size, self.hidden_size, self.num_layers, bidirectional=self.is_bidirectional, batch_first=True)
+        elif model_type == 'gru':
+            self.model = torch.nn.GRU(self.input_size, self.hidden_size, self.num_layers, bidirectional=self.is_bidirectional, batch_first=True)
+        elif model_type == 'rnn':
+            self.model = torch.nn.RNN(self.input_size, self.hidden_size, self.num_layers, bidirectional=self.is_bidirectional, batch_first=True)
+        elif model_type == 'cnn':
+            kernel_size = 61
+            conv_layers = []
+            # 第一层卷积
+            conv = torch.nn.Conv1d(
+                    in_channels=self.input_size,
+                    out_channels=self.hidden_size,
+                    kernel_size=kernel_size,
+                    stride=1,
+                    padding=(kernel_size-1)//2  # 保持时序长度不变
+                )
+            bn = torch.nn.BatchNorm1d(self.hidden_size)
+            act = torch.nn.ReLU()
+            conv_layers.extend([conv, bn, act])
+            # 剩余卷积层
+            for i in range(num_layers-1):
+                conv = torch.nn.Conv1d(
+                    in_channels=self.hidden_size,
+                    out_channels=self.hidden_size,
+                    kernel_size=kernel_size,
+                    stride=1,
+                    padding=(kernel_size-1)//2  # 保持时序长度不变
+                )
+                bn = torch.nn.BatchNorm1d(self.hidden_size)
+                act = torch.nn.ReLU()
+                conv_layers.extend([conv, bn, act])
+            self.model = torch.nn.Sequential(*conv_layers)
+            self.num_directions = 1
+        elif model_type == 'transformer':
+            self.input_proj = torch.nn.Linear(self.input_size, self.hidden_size)
+
+
+            self.blocks = torch.nn.ModuleList([
+            RelPosBlock(
+                dim=self.hidden_size,
+                num_heads=4,
+                mlp_ratio=2,
+            )
+            for i in range(self.num_layers)])
+            self.model = torch.nn.Sequential(*self.blocks)
+            # self.model = torch.nn.Sequential(transformer_encoder)
+            self.num_directions = 1
+
+            
+        self.to_pose = torch.nn.Linear(hidden_size * self.num_directions, self.poses_size)
+        self.to_tran = torch.nn.Linear(hidden_size * self.num_directions, trans_size)
+        self.to_shape = MLP(input_size=hidden_size * self.num_directions,
+                            output_size=betas_size, hidden_size=hidden_size,
+                            num_layers=2, dropout_p=m_dropout,
+                            skip_connection=False, use_batch_norm=False)
+
+    def cell_init(self, inputs_):
+        """Return the initial state of the cell."""
+        if self.learn_init_state:
+            # Learn the initial state based on the first frame.
+            if self.model_type == 'lstm':
+                c0 = self.to_init_state_c(inputs_[:, 0:1])
+                c0 = c0.reshape(-1, self.num_layers*self.num_directions, self.hidden_size).transpose(0, 1)
+                h0 = self.to_init_state_h(inputs_[:, 0:1])
+                h0 = h0.reshape(-1, self.num_layers*self.num_directions, self.hidden_size).transpose(0, 1)
+                return c0.contiguous(), h0.contiguous()
+            else :                
+                h0 = self.to_init_state_h(inputs_[:, 0:1])
+                h0 = h0.reshape(-1, self.num_layers*self.num_directions, self.hidden_size).transpose(0, 1)
+                return h0.contiguous()
+        else:
+            return self.init_state
+
+    def model_name(self):
+        """A summary string of this model."""
+        base_name = "ContinuitySequence-{}".format('-'.join([str(self.hidden_size)] * self.num_layers))
+        base_name = base_name + "-" + self.model_type
+        if self.is_bidirectional:
+            base_name = "Bi" + base_name
+        return base_name
+
+    def forward(self, x, is_new_sequence=True):
+        if is_new_sequence:
+            self.final_state = None
+            self.init_state = self.cell_init(x)
+        else:
+            self.init_state = self.final_state
+
+        inputs_ = self.input_drop(x)
+
+
+        # Feed it to the LSTM.
+        # Disable CuDNN for higher-order gradients (meta-learning compatibility)
+        # with torch.backends.cudnn.flags(enabled=False):
+        if self.model_type == 'cnn':
+            inputs_ = inputs_.transpose(1, 2)
+            out = self.model(inputs_)
+            out = out.transpose(1, 2)
+        elif self.model_type == 'transformer':
+            x = self.input_proj(inputs_) 
+            # x = x + self.pos_encoder[:, :x.shape[1], :]
+            out = self.model(x)
+        else:
+            # Get the initial state of the recurrent cells.
+            out, final_state = self.model(inputs_, self.init_state)
+            self.final_state = final_state  
+
+
+        pose_hat = self.to_pose(out)  # (N, F, self.output_size)
+        if self.rotation_mode == 'ortho6d':
+            B,L,_ = pose_hat.shape
+            pose_hat = continuity_tools.compute_rotation_matrix_from_ortho6d(pose_hat.reshape(B*L*self.num_joints, 6))
+            pose_hat = pose_hat.reshape(B,L,self.num_joints,3,3)
+        elif self.rotation_mode == 'quaternion':
+            B,L,_ = pose_hat.shape
+            pose_hat = continuity_tools.compute_rotation_matrix_from_quaternion(pose_hat.reshape(B*L*self.num_joints, 4))
+            pose_hat = pose_hat.reshape(B,L,self.num_joints,3,3)
+        elif self.rotation_mode == 'axisangle':
+            B,L,_ = pose_hat.shape
+            pose_hat = continuity_tools.compute_rotation_matrix_from_axisAngle(pose_hat.reshape(B*L*self.num_joints, 3))
+            pose_hat = pose_hat.reshape(B,L,self.num_joints,3,3)
+        elif self.rotation_mode == 'rotmat':
+            B,L,_ = pose_hat.shape
+            pose_hat = pose_hat.reshape(B*L*self.num_joints, 3,3)
+            pose_hat = continuity_tools.compute_rotation_matrix_from_matrix(pose_hat)
+            pose_hat = pose_hat.reshape(B,L,self.num_joints,3,3)
+        
+        tran_hat = self.to_tran(out)
+        # Estimate shape if configured.
+
+        s = self.to_shape(out)  # (N, F, N_BETAS)
+        shape_hat = torch.mean(s, dim=1, keepdim=True)
+
+        return {'poses': pose_hat,
+                'betas': shape_hat,
+                'trans': tran_hat}
+
 
 
 class FrameModel(torch.nn.Module):

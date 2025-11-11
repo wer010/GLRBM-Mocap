@@ -21,14 +21,14 @@ rigidbody_marker_id = {
     "left_arm": 2821,     # 2
     "left_forearm": 1591, # 3
     "left_hand": 2000,    # 4
-    "left_leg": 981,      # 5
+    "left_thigh": 981,      # 5
     "left_shin": 1115,    # 6
     "left_foot": 3341,    # 7
     # "left_hip":809,
     "right_arm": 4794,    # 8
     "right_forearm": 5059,# 9
     "right_hand": 5459,   # 10
-    "right_leg": 4465,    # 11
+    "right_thigh": 4465,    # 11
     "right_shin": 4599,   # 12
     "right_foot": 6742,   # 13
     # "right_hip":4297
@@ -103,6 +103,11 @@ rbm_c_parent = [1,-1,1,2,1,4,1,6,1,8]
 rbm_d_config = [0,1,4,7,10,13]
 rbm_d_parent = [1,-1,1,1,1,1]
 
+rbm_e_config = [0,1,2,5,8,11]
+rbm_e_parent = [1,-1,1,1,1,1]
+
+rbm_f_config = [0,1,3,6,9,12]
+rbm_f_parent = [1,-1,1,1,1,1]
 
 def rela_x_fn(x, marker_type = 'moshpp'):
     if marker_type == 'moshpp':
@@ -126,6 +131,10 @@ def rela_x_fn(x, marker_type = 'moshpp'):
             rbm_parent_tensor = torch.tensor(rbm_c_parent, dtype=torch.int).to(x.device)
         elif marker_type == 'rbm_d':
             rbm_parent_tensor = torch.tensor(rbm_d_parent, dtype=torch.int).to(x.device)
+        elif marker_type == 'rbm_e':
+            rbm_parent_tensor = torch.tensor(rbm_e_parent, dtype=torch.int).to(x.device)
+        elif marker_type == 'rbm_f':
+            rbm_parent_tensor = torch.tensor(rbm_f_parent, dtype=torch.int).to(x.device)
         quat_ori_parent = quat_ori[..., rbm_parent_tensor,:]
         identity = quat_ori_parent.new_tensor([1, 0, 0, 0])
         quat_ori_parent[...,1,:] = identity
@@ -196,6 +205,10 @@ class AmassLmdbDataset(Dataset):
                 marker_info = marker_info[:,rbm_c_config,:]
             elif self.marker_type == 'rbm_d':
                 marker_info = marker_info[:,rbm_d_config,:]
+            elif self.marker_type == 'rbm_e':
+                marker_info = marker_info[:,rbm_e_config,:]
+            elif self.marker_type == 'rbm_f':
+                marker_info = marker_info[:,rbm_f_config,:]
         else:
             marker_info = data['marker_pos']
         if self.use_rela_x:
@@ -397,3 +410,4 @@ if __name__ == '__main__':
 
     # convert_amass_to_lmdb(data_root='data/BMLrub', output_file='data/BMLrub_lmdb', marker_type='rbm')
     # convert_amass_to_lmdb(data_root='data/BMLrub', output_file='data/BMLrub_lmdb', marker_type='moshpp')
+    

@@ -3,12 +3,15 @@ from dataclasses import dataclass, asdict, fields
 import numpy as np
 import torch
 import pyrender
+from torch.utils.data import DataLoader
 import trimesh
 from aitviewer.configuration import CONFIG as C
+from aitviewer.renderables.rigid_bodies import RigidBodies
 from aitviewer.renderables.smpl import SMPLSequence
 from aitviewer.viewer import Viewer
 from aitviewer.models.smpl import SMPLLayer
 from aitviewer.renderables.point_clouds import PointClouds
+from scipy.spatial.transform import Rotation as R
 
 
 Tensor = NewType('Tensor', torch.Tensor)
@@ -97,15 +100,10 @@ def to_tensor(
         return torch.tensor(array, dtype=dtype)
 
 
-
-
-
-
 class Struct(object):
     def __init__(self, **kwargs):
         for key, val in kwargs.items():
             setattr(self, key, val)
-
 
 
 def rot_mat_to_euler(rot_mats):
@@ -202,7 +200,7 @@ def visualize_trimesh(vertices, faces, extra_point=None, lcs=None, show=True, sa
         print(f"Saved scene image to {save_path}")
 
 
-def visualize_aitviewer(model_type, full_poses, betas=None, trans=None, extra_points = None):
+def visualize_aitviewer(model_type, full_poses, betas=None, trans=None, rbs=None,extra_points = None):
 
     smpl_layer = SMPLLayer(model_type=model_type, gender="neutral", device=C.device)
     seq_smpl = SMPLSequence(
@@ -215,6 +213,25 @@ def visualize_aitviewer(model_type, full_poses, betas=None, trans=None, extra_po
     )
     v = Viewer()
     v.scene.add(seq_smpl)
+
+    if rbs is not None:
+        L, N,_ = rbs["pos"].shape
+        if isinstance(rbs["ori"], torch.Tensor):
+            ori = rbs["ori"].cpu().numpy()
+        else:
+            ori = rbs["ori"]
+        if isinstance(rbs["pos"], torch.Tensor):
+            pos = rbs["pos"].cpu().numpy()
+        else:
+            pos = rbs["pos"]
+
+        if ori.ndim==3:
+            ori_mat = R.from_rotvec(ori.reshape(-1, 3)).as_matrix().reshape(L, N, 3, 3)
+        else:
+            ori_mat = ori
+        rbs = RigidBodies(pos, ori_mat, length=0.1, gui_affine=False, name="RBMs")
+        rbs.rotation = np.matmul(np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]]), rbs.rotation)
+        v.scene.add(rbs)
     if extra_points is not None:
         # 定义不同颜色区间和对应的颜色 (RGBA格式)
         color = [
@@ -233,7 +250,47 @@ def visualize_aitviewer(model_type, full_poses, betas=None, trans=None, extra_po
 
     v.run()
 
-def vis_diff_aitviewer(model_type, gt_full_poses, pred_full_poses, gt_betas=None, pred_betas=None, gt_trans=None, pred_trans=None):
+def vis_rbm_aitviewer(rbm, z_up=False):
+    v = Viewer()
+    color_list = [
+        (0.0, 1.0, 0.5, 1.0),
+        (0.0, 0.0, 1.0, 1.0),
+        (1.0, 0.0, 0.0, 1.0),
+        (0.0, 1.0, 0.0, 1.0),
+        (1.0, 0.0, 1.0, 1.0),
+    ]
+    # assert len(rbm)<=len(color_list), "The number of rbm is greater than the number of colors"
+    for i, data in enumerate(rbm):
+        L, N,_ = data["pos"].shape
+        if isinstance(data["ori"], torch.Tensor):
+            ori = data["ori"].cpu().numpy()
+        else:
+            ori = data["ori"]
+        if isinstance(data["pos"], torch.Tensor):
+            pos = data["pos"].cpu().numpy()
+        else:
+            pos = data["pos"]
+
+        if ori.ndim==3:
+            ori_mat = R.from_rotvec(ori.reshape(-1, 3)).as_matrix().reshape(L, N, 3, 3)
+        else:
+            ori_mat = ori
+        rbs = RigidBodies(pos, ori_mat, length=0.1, gui_affine=False, name=f"RBMs_{i}", color=color_list[i%5])
+        if z_up:
+            rbs.rotation = np.matmul(np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]]), rbs.rotation)
+        v.scene.add(rbs)
+    v.run()
+
+
+def vis_diff_aitviewer(
+    model_type,
+    gt_full_poses,
+    pred_full_poses,
+    gt_betas=None,
+    pred_betas=None,
+    gt_trans=None,
+    pred_trans=None,
+):
     smpl_layer = SMPLLayer(model_type=model_type, gender="female", device=C.device)
 
     gt_smpl = SMPLSequence(
@@ -244,6 +301,7 @@ def vis_diff_aitviewer(model_type, gt_full_poses, pred_full_poses, gt_betas=None
         trans=gt_trans,
         z_up=True
     )
+
     offset = torch.tensor([[1.0,0.0,0.0]]).to(pred_full_poses.device)
     pred_smpl = SMPLSequence(
         smpl_layer=smpl_layer,
@@ -257,7 +315,6 @@ def vis_diff_aitviewer(model_type, gt_full_poses, pred_full_poses, gt_betas=None
     v.scene.add(gt_smpl)
     v.scene.add(pred_smpl)
     v.run()
-
 
 
 def vis_diff(pred_verts, gt_verts, faces):
@@ -339,3 +396,4 @@ def add_coordinate_systems_to_scene(scene, lcs, scale=0.05):
             matrix=transform
         )
         scene.add_node(coord_node)
+

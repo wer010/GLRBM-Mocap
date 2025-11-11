@@ -5,9 +5,9 @@ import numpy as np
 import argparse
 import json
 import os.path as osp
-from data import rigidbody_marker_id, moshpp_marker_id, virtual_marker, AmassLmdbDataset, train_collate_fn, rbm_a_config, rbm_b_config, rbm_c_config, rbm_d_config
+from data import rigidbody_marker_id, moshpp_marker_id, virtual_marker, AmassLmdbDataset, train_collate_fn, rbm_a_config, rbm_b_config, rbm_c_config, rbm_d_config, rbm_e_config, rbm_f_config
 from torch.utils.data import DataLoader, random_split
-from models import Moshpp, FrameModel, SequenceModel
+from models import ContinuitySequenceModel, Moshpp, FrameModel, SequenceModel
 from metric import MetricsEngine
 from smpl import Smpl
 from tqdm import tqdm
@@ -15,9 +15,7 @@ from datetime import datetime
 from utils import visualize_aitviewer, vis_diff_aitviewer
 import torch.optim as optim
 from tensorboardX import SummaryWriter
-torch.backends.cuda.enable_flash_sdp(False)
-torch.backends.cuda.enable_mem_efficient_sdp(False)
-torch.backends.cuda.enable_math_sdp(True)
+from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_axis_angle
 
 
 
@@ -56,7 +54,7 @@ def geodesic_loss(aa1, aa2):
     return torch.mean(distance)
 
 
-def loss_fn(output, gt, smpl_model=None, do_fk=True, use_geodesic_loss=True):
+def loss_fn(output, gt, smpl_model=None, do_fk=True, use_geodesic_loss=True, use_continuity_loss=False):
     B = output["poses"].shape[0]
     L = output["poses"].shape[1]
     device = output["poses"].device
@@ -66,20 +64,36 @@ def loss_fn(output, gt, smpl_model=None, do_fk=True, use_geodesic_loss=True):
 
     shape_loss = l1_loss(output["betas"].view(B, -1), gt["betas"])
     tran_loss = mse_loss(output["trans"], gt["trans"])
-    if use_geodesic_loss:
-        pose_loss = geodesic_loss(output["poses"].reshape(B, L, -1, 3), gt["poses"].reshape(B, L, -1, 3))
+    if not use_continuity_loss:
+        if use_geodesic_loss:
+            pose_loss = geodesic_loss(output["poses"].reshape(B, L, -1, 3), gt["poses"].reshape(B, L, -1, 3))
+        else:
+            pose_loss = mse_loss(output["poses"].reshape(B, L, -1, 3), gt["poses"].reshape(B, L, -1, 3))
+        if do_fk:
+            joints_hat = smpl_model(
+                betas=output["betas"].expand(-1, L, -1).reshape(B * L, -1),
+                body_pose=output["poses"].reshape(B * L, -1)[:, 3:],
+                global_orient=output["poses"].reshape(B * L, -1)[:, 0:3],
+                transl=output["trans"].reshape(B * L, -1),
+            )["joints"].reshape(B, L, -1, 3)
+            fk_loss = mse_loss(joints_hat, gt["joints"])
+        else:
+            fk_loss = torch.zeros(1, device=device)
     else:
-        pose_loss = mse_loss(output["poses"].reshape(B, L, -1, 3), gt["poses"].reshape(B, L, -1, 3))
-    if do_fk:
-        joints_hat = smpl_model(
-            betas=output["betas"].expand(-1, L, -1).reshape(B * L, -1),
-            body_pose=output["poses"].reshape(B * L, -1)[:, 3:],
-            global_orient=output["poses"].reshape(B * L, -1)[:, 0:3],
-            transl=output["trans"].reshape(B * L, -1),
-        )["joints"].reshape(B, L, -1, 3)
-        fk_loss = mse_loss(joints_hat, gt["joints"])
-    else:
-        fk_loss = torch.zeros(1, device=device)
+        gt_poses = axis_angle_to_matrix(gt["poses"].reshape(B, L, -1, 3))
+        pose_loss = mse_loss(output["poses"].reshape(B, L, -1, 3, 3),  gt_poses)
+        output_poses = matrix_to_axis_angle(output["poses"].reshape(B, L, -1, 3, 3))
+        if do_fk:
+            joints_hat = smpl_model(
+                betas=output["betas"].expand(-1, L, -1).reshape(B * L, -1),
+                body_pose=output_poses.reshape(B * L, -1)[:, 3:],
+                global_orient=output_poses.reshape(B * L, -1)[:, 0:3],
+                transl=output["trans"].reshape(B * L, -1),
+            )["joints"].reshape(B, L, -1, 3)
+            fk_loss = mse_loss(joints_hat, gt["joints"])
+        else:
+            fk_loss = torch.zeros(1, device=device)
+    
     total_loss = pose_loss + shape_loss + tran_loss + 0.1 * fk_loss
 
     losses = {
@@ -90,6 +104,7 @@ def loss_fn(output, gt, smpl_model=None, do_fk=True, use_geodesic_loss=True):
         "total_loss": total_loss,
     }
     return losses
+
 
 
 def train(
@@ -104,7 +119,8 @@ def train(
     lr=5e-4,
     epochs=400,
     lr_decay = True,
-    use_geodesic_loss = True
+    use_geodesic_loss = True,
+    use_continuity_loss = False,
 ):
     writer = SummaryWriter(os.path.join(save_dir, "logs"))
     best_mpjpe = torch.inf
@@ -127,8 +143,8 @@ def train(
             global_step += 1
 
             output = model(x)
+            losses = loss_fn(output, data, smpl_model, use_geodesic_loss=use_geodesic_loss, use_continuity_loss=use_continuity_loss)
 
-            losses = loss_fn(output, data, smpl_model, use_geodesic_loss=use_geodesic_loss)
             if writer is not None:
                 for k in losses:
                     prefix = f"Train_losses/{k}"
@@ -149,7 +165,8 @@ def train(
                         model_path = None,
                         device = device,
                         vis=False,
-                        val=True
+                        val=True,
+                        use_continuity_loss=use_continuity_loss
                     )
         for key, value in eval_result.items():
             writer.add_scalar(f"Test/{key}", value, epoch)
@@ -170,7 +187,8 @@ def test(
     model_path=None,
     device="cuda",
     vis=False,
-    val=False
+    val=False,
+    use_continuity_loss=False
 ):
 
     testloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
@@ -201,6 +219,9 @@ def test(
                 chunk_x = x[:, 120*i:120*(i+1),:].contiguous()
                 seq_len = chunk_x.shape[1]
                 output = model(chunk_x, is_new_sequence=is_new_sequence)
+                if use_continuity_loss:
+                    output["poses"] = matrix_to_axis_angle(output["poses"].reshape(seq_len, -1, 3, 3)).reshape(B, seq_len, -1)
+
 
                 output["joints"] = smpl_model(
                 betas=output["betas"].reshape(-1),
@@ -219,6 +240,8 @@ def test(
  
         else:
             output = model(x, is_new_sequence=True)
+            if use_continuity_loss:
+                output["poses"] = matrix_to_axis_angle(output["poses"].reshape(B, L, -1, 3, 3)).reshape(B, L, -1)
 
             output["joints"] = smpl_model(
             betas=output["betas"].reshape(-1),
@@ -284,6 +307,10 @@ def main(config):
             vid = vid[rbm_c_config]
         elif config.marker_type == "rbm_d":
             vid = vid[rbm_d_config]
+        elif config.marker_type == "rbm_e":
+            vid = vid[rbm_e_config]
+        elif config.marker_type == "rbm_f":
+            vid = vid[rbm_f_config]
     else:
         raise ValueError(f"未知的marker_type: {config.marker_type}")
     n_marker = len(vid)
@@ -297,7 +324,7 @@ def main(config):
     save_dir = osp.join("./results", f'{datetime.now().strftime("%Y%m%d-%H%M")}-{config.base_model}-{config.train_mode}-{config.marker_type}-{config.epochs}epochs')
 
     # 根据配置选择模型
-
+    use_continuity_loss = False
     if config.base_model == "sequence":
         model = SequenceModel(
             input_size=input_dim,
@@ -320,6 +347,20 @@ def main(config):
             hidden_size=config.hidden_size,
             m_dropout=config.dropout if hasattr(config, "dropout") else 0.0,
         ).to(device)
+    elif config.base_model == "continuity":
+        model = ContinuitySequenceModel(
+            input_size=input_dim,
+            betas_size=10,
+            poses_size=24 * 3,
+            trans_size=3,
+            num_layers=config.num_layers,
+            hidden_size=config.hidden_size,
+            m_dropout=config.dropout if hasattr(config, "dropout") else 0.0,
+            m_bidirectional=True,
+            model_type=config.model_type,
+            rotation_mode = 'axisangle'
+        ).to(device)
+        use_continuity_loss = True
     else:
         raise ValueError(f"未知的base_model: {config.base_model}")
 
@@ -359,7 +400,9 @@ def main(config):
             lr=config.lr,
             epochs=config.epochs,
             lr_decay=config.lr_decay,
-            use_geodesic_loss=config.use_geodesic_loss
+            use_geodesic_loss=config.use_geodesic_loss,
+            use_continuity_loss=use_continuity_loss
+
         )
         test_dir = save_dir
     elif config.train_mode == "test":
@@ -380,6 +423,7 @@ def main(config):
         model_path = test_dir,
         device = device,
         vis=False,
+        use_continuity_loss=use_continuity_loss
     )
     test_result = test(
         test_dataset = test_dataset,
@@ -389,14 +433,15 @@ def main(config):
         model_path = test_dir,
         device = device,
         vis=False,
+        use_continuity_loss=use_continuity_loss
     )
-
-    with open(osp.join(save_dir, "best_epoch.txt"), "w") as f:
-        f.write(f'The best epoch is {best_epoch}.\n')
-        f.write("Train result:\n")
-        f.write(json.dumps(train_result, indent=4, ensure_ascii=False))
-        f.write("Test result:\n")
-        f.write(json.dumps(test_result, indent=4, ensure_ascii=False))
+    if config.train_mode == "train":
+        with open(osp.join(save_dir, "best_epoch.txt"), "w") as f:
+            f.write(f'The best epoch is {best_epoch}.\n')
+            f.write("Train result:\n")
+            f.write(json.dumps(train_result, indent=4, ensure_ascii=False))
+            f.write("Test result:\n")
+            f.write(json.dumps(test_result, indent=4, ensure_ascii=False))
 
 
     return
@@ -449,7 +494,7 @@ if __name__ == "__main__":
         "--base_model",
         type=str,
         default="sequence",
-        choices=["frame", "sequence"],
+        choices=["frame", "sequence","continuity"],
         help="Backbone model type.",
     )
     parser.add_argument(
@@ -508,7 +553,7 @@ if __name__ == "__main__":
         "--marker_type",
         type=str,
         default="rbm",
-        choices=["moshpp", "rbm", "rbm_a", "rbm_b", "rbm_c", "rbm_d"],
+        choices=["moshpp", "rbm", "rbm_a", "rbm_b", "rbm_c", "rbm_d", "rbm_e", "rbm_f"],
         help="Marker type.",
     )
 

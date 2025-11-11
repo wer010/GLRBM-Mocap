@@ -69,16 +69,6 @@ class TransformedCoeffs(Ch):
         _, closest = sknbrs.kneighbors(self.markers_latent.r)
         self.closest = np.vstack(closest)
 
-        # n_mrks = self.markers_latent.shape[0]
-        # n_vrts = self.can_body.shape[0]
-        # closest_alt = []
-        # for mIdx in range(n_mrks):
-        #     A = np.repeat(self.markers_latent[mIdx][np.newaxis], repeats=n_vrts, axis=0)
-        #     A_distances = np.sqrt(np.sum(np.square(A - can_body),axis=1))
-        #     unsorted_closest_idx = np.argpartition(A_distances, 3)[:3]
-        #     closest_alt.append(unsorted_closest_idx[np.argsort(A_distances[unsorted_closest_idx])])
-        # closest_alt = np.asarray(closest_alt)
-        # self.closest = closest_alt
 
         self.diff = (markers_latent - can_body[self.closest[:, 0]]).reshape((-1, 3))
         self.e1 = can_body[self.closest[:, 1]] - can_body[self.closest[:, 0]]
@@ -155,3 +145,59 @@ class TransformedLms(Ch):
 
         if '_result' not in self.dterms:
             self.add_dterm('_result', self._result)
+
+
+class TransformedCoeffs_RBM(Ch):
+    dterms = 'can_body', 'markers_latent_pos', 'markers_latent_ori'
+
+
+    def compute_r(self):
+        return self._result.r
+
+    def compute_dr_wrt(self, wrt):
+        if wrt is self._result:
+            return 1
+
+    def on_changed(self, which):
+        # print ('Merry Coeffs')
+
+        can_body = self.can_body
+        markers_latent_pos = self.markers_latent_pos
+        markers_latent_ori = self.markers_latent_ori
+
+
+        can_body_no_eyeballs = self.can_body.r
+        sknbrs = NearestNeighbors(algorithm='kd_tree', n_neighbors=8).fit(can_body_no_eyeballs)
+        _, closest = sknbrs.kneighbors(self.markers_latent.r)
+        self.closest = np.vstack(closest)
+
+
+        self.diff = (markers_latent_pos - can_body[self.closest[:, 0]]).reshape((-1, 3))
+        self.e1 = can_body[self.closest[:, 1]] - can_body[self.closest[:, 0]]
+        self.e2 = can_body[self.closest[:, 2]] - can_body[self.closest[:, 0]]
+
+        self.f1 = nrm(self.e1)
+
+        NN_counter = 3
+        while (np.isnan(nrm(ch.cross(self.e1, self.e2)).sum()) and NN_counter < self.closest.shape[0]):
+            self.e2 = can_body[self.closest[:, NN_counter]] - can_body[self.closest[:, 0]]
+            NN_counter += 1
+            print('nearest neighbors are on a line, trying to find next neighbor!!')
+
+        self.closest[:, 2] = self.closest[:, NN_counter - 1]
+        self.f2 = nrm(ch.cross(self.e1, self.e2))
+        self.f3 = ch.cross(self.f1, self.f2)  # normalizing this is redundant
+
+        project = lambda x, y: (ch.sum(x * y, axis=1)).reshape((-1, 1))
+        self.coefs1 = project(self.diff, self.f1)
+        self.coefs2 = project(self.diff, self.f2)
+        self.coefs3 = project(self.diff, self.f3)
+
+        
+
+        _result = ch.hstack([self.coefs1, self.coefs2, self.coefs3])
+        if not hasattr(self, '_result'):
+            self.add_dterm('_result', _result)
+        else:
+            self._result = _result
+
