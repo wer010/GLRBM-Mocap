@@ -43,7 +43,20 @@ rbm_map = {
 
 
 import torch
-
+betas_yjl = torch.tensor(
+    [
+        -0.55045104,
+        -0.52951753,
+        -0.41248605,
+        0.31506306,
+        -0.26099595,
+        -0.48031747,
+        -1.3245354,
+        -0.14434478,
+        0.68180835,
+        0.00956408,
+    ]
+)
 def geodesic_dis_quaternion(q1, q2):
     rel_rot = quaternion_multiply(q1, quaternion_invert(q2))  # (L-1, N, 4)
     rel_angle = 2 * torch.acos(torch.clamp(rel_rot[..., 0], -1, 1))  # (L-1, N)
@@ -216,7 +229,7 @@ def load_data(data_path):
         # ret[key] = ret[key][:, mask, :]
     # 可视化数据
 
-    vis_rbm_aitviewer([{'pos': ret["pos"][:, i:i+1, :], 'ori': ret["ori"][:, i:i+1, :]} for i in range(ret["pos"].shape[1])],z_up=True)
+    # vis_rbm_aitviewer([{'pos': ret["pos"][:, i:i+1, :], 'ori': ret["ori"][:, i:i+1, :]} for i in range(ret["pos"].shape[1])],z_up=True)
 
     # ret["ori"] = repair_axis_angle_jumps(ret["ori"])
     
@@ -233,20 +246,7 @@ def rbm_calibration(real_markers):
     template_markers_pos = real_markers_pos[ind,...]
     template_markers_ori = real_markers_ori[ind,...]
 
-    betas = torch.tensor(
-        [
-            -0.55045104,
-            -0.52951753,
-            -0.41248605,
-            0.31506306,
-            -0.26099595,
-            -0.48031747,
-            -1.3245354,
-            -0.14434478,
-            0.68180835,
-            0.00956408,
-        ]
-    )
+
     vid = [value for value in rigidbody_marker_id.values()]
     n_marker = len(vid)
     pos_offset = torch.tensor([0.0095, 0, 0, 1]).expand([n_marker, -1])
@@ -255,7 +255,7 @@ def rbm_calibration(real_markers):
     pose = torch.zeros(1, 24*3)
     pose[:, 0:3] = torch.tensor([1.57079633, -0.        , -0.])
     trans = torch.tensor([[0.0000,  0.0000,  0.88]])
-    virtual_marker_pos, virtual_marker_ori, virtual_v_posed, virtual_joints = virtual_marker(betas,
+    virtual_marker_pos, virtual_marker_ori, virtual_v_posed, virtual_joints = virtual_marker(betas_yjl,
                                                                 pose,
                                                                 trans,
                                                                 vid_tensor,
@@ -263,7 +263,7 @@ def rbm_calibration(real_markers):
                                                                 ori_offset,
                                                                 visualize_flag=False)
 
-    visualize_aitviewer("smpl", pose, betas, trans, rbs={'pos': virtual_marker_pos.squeeze()[None,...], 'ori': virtual_marker_ori.squeeze()[None,...]})
+    # visualize_aitviewer("smpl", pose, betas_yjl, trans, rbs={'pos': virtual_marker_pos.squeeze()[None,...], 'ori': virtual_marker_ori.squeeze()[None,...]})
     virtual_marker_pos = virtual_marker_pos.squeeze()
     virtual_marker_ori = virtual_marker_ori.squeeze()
 
@@ -283,7 +283,7 @@ def rbm_calibration(real_markers):
     all_cali_real_markers = {'pos': cali_real_pos, 'ori': cali_real_ori}
 
     cali_real_markers = {'pos': cali_real_pos[ind,...][None,...], 'ori': cali_real_ori[ind,...][None,...]}
-    vis_rbm_aitviewer([all_cali_real_markers], z_up=True)
+    # vis_rbm_aitviewer([all_cali_real_markers], z_up=True)
     vis_rbm_aitviewer([template_markers, virtual_markers, aligned_virtual_markers, cali_real_markers], z_up=True)
 
     # transform the virtual markers to the real markers
@@ -322,12 +322,6 @@ def test(
             seq_len = chunk_x.shape[1]
             output = model(chunk_x, is_new_sequence=is_new_sequence)
 
-            output["joints"] = smpl_model(
-            betas=output["betas"].reshape(-1),
-            body_pose=output["poses"].reshape(seq_len, -1)[:, 3:],
-            global_orient=output["poses"].reshape(seq_len, -1)[:, 0:3],
-            transl=output["trans"].reshape(seq_len, -1),
-            )["joints"].reshape(1, seq_len, -1, 3)
 
             output_list.append(output)
         output = {}
@@ -340,12 +334,7 @@ def test(
     else:
         output = model(x, is_new_sequence=True)
 
-        output["joints"] = smpl_model(
-        betas=output["betas"].reshape(-1),
-        body_pose=output["poses"].reshape(L, -1)[:, 3:],
-        global_orient=output["poses"].reshape(L, -1)[:, 0:3],
-        transl=output["trans"].reshape(L, -1),
-        )["joints"].reshape(1, L, -1, 3)
+
 
     
     # 可视化当前sequence
@@ -353,7 +342,7 @@ def test(
     visualize_aitviewer(
         "smpl",
         output["poses"][0],
-        output["betas"][0],
+        betas_yjl,
         output["trans"][0],
         rbs={'pos': test_data["pos"], 'ori': test_data["ori"]},
     )
@@ -465,13 +454,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="data/real_data/1103/subject-tpose-action1.csv",
+        default="data/real_data/1105/subject1-tpose-static2.csv",
         help="Path to data.",
     )
     parser.add_argument(
         "--smpl_model_path",
         type=str,
-        default="data/models/smpl/SMPL_NEUTRAL.npz",
+        default="data/models/smpl/SMPL_FEMALE.npz",
         help="Path to smpl model.",
     )
     parser.add_argument(

@@ -54,7 +54,7 @@ def geodesic_loss(aa1, aa2):
     return torch.mean(distance)
 
 
-def loss_fn(output, gt, smpl_model=None, do_fk=True, use_geodesic_loss=True, use_continuity_loss=False):
+def loss_fn(output, gt, smpl_model=None, do_fk=False, use_geodesic_loss=True, use_continuity_loss=False):
     B = output["poses"].shape[0]
     L = output["poses"].shape[1]
     device = output["poses"].device
@@ -557,49 +557,9 @@ if __name__ == "__main__":
         help="Marker type.",
     )
 
-    parser.add_argument(
-        "--use_real_offsets",
-        action="store_true",
-        help="Sampling is informed by real offset distribution.",
-    )
-    parser.add_argument(
-        "--offset_noise_level",
-        type=int,
-        default=0,
-        help="How much noise to add to real offsets.",
-    )
 
-    # Data augmentation.
-    parser.add_argument(
-        "--noise_num_markers",
-        type=int,
-        default=1,
-        help="How many markers are affected by the noise.",
-    )
-    parser.add_argument(
-        "--spherical_noise_strength",
-        type=float,
-        default=0.0,
-        help="Magnitude of noise in %.",
-    )
-    parser.add_argument(
-        "--spherical_noise_length",
-        type=float,
-        default=0.0,
-        help="Temporal length of noise in %.",
-    )
-    parser.add_argument(
-        "--suppression_noise_length",
-        type=float,
-        default=0.0,
-        help="Marker suppression length.",
-    )
-    parser.add_argument(
-        "--suppression_noise_value",
-        type=float,
-        default=0.0,
-        help="Marker suppression value.",
-    )
+
+    
 
     config = parser.parse_args()
     main(config)

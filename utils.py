@@ -202,7 +202,7 @@ def visualize_trimesh(vertices, faces, extra_point=None, lcs=None, show=True, sa
 
 def visualize_aitviewer(model_type, full_poses, betas=None, trans=None, rbs=None,extra_points = None):
 
-    smpl_layer = SMPLLayer(model_type=model_type, gender="neutral", device=C.device)
+    smpl_layer = SMPLLayer(model_type=model_type, gender="female", device=C.device)
     seq_smpl = SMPLSequence(
         smpl_layer=smpl_layer,
         poses_body=full_poses[:, 3:],
