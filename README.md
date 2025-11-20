@@ -76,7 +76,11 @@ test(
 - `smpl.py`: SMPL model implementation
 - `utils.py`: Utility functions including visualization
 
+## Third-Party Libraries
+
+This project integrates visualization utilities adapted from [aitviewer](https://github.com/eth-ait/aitviewer), an MIT-licensed toolkit developed by ETH Zurich for interactive inspection of SMPL-based sequences. Please refer to their repository for detailed documentation and licensing information.
+
 ## License
 
-[Add your license information here]
+All code in this repository is released **for academic research and education only**. Any commercial use, redistribution for profit, or incorporation into proprietary products is strictly prohibited without prior written permission from the author. When using this project in academic settings, please provide appropriate citation and retain third-party notices (e.g., MIT license statement for [aitviewer](https://github.com/eth-ait/aitviewer)).
 
